@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v1.0.45] - 2026-09-08
 
 ### Fixed
 - vx no longer quits silently (menu-bar icon vanishing, no error) when the transcription backend dies mid-recording; the failure is now shown as an error in the HUD.
