@@ -249,7 +249,7 @@ final class AppUnderTest {
     /// The bundle path of a running `vx`, or nil.
     static func runningVXBundlePath() -> String? {
         let running = NSWorkspace.shared.runningApplications.first {
-            $0.bundleIdentifier == "com.example.vx" || $0.localizedName == "vx"
+            $0.bundleIdentifier == "com.example.vx" || $0.bundleIdentifier == "com.example.vx.dev" || $0.localizedName == "vx"
         }
         if let url = running?.bundleURL { return url.path }
         // Fall back to `ps` for a directly-launched executable with no bundle registration.
