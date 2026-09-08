@@ -23,18 +23,25 @@ final class DebugLogger: ObservableObject {
     }()
 
     private init() {
-        let logsDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs")
-        logFileURL = logsDir.appendingPathComponent("vx-debug.log")
+        let profile = RuntimeProfile.current
+        logFileURL = profile.logFileURL
 
         let fm = FileManager.default
+        // Hermetic runs point the log at a scratch directory that may not exist yet.
+        try? fm.createDirectory(
+            at: logFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         if !fm.fileExists(atPath: logFileURL.path) {
             fm.createFile(atPath: logFileURL.path, contents: nil)
         }
         fileHandle = try? FileHandle(forWritingTo: logFileURL)
         fileHandle?.seekToEndOfFile()
 
-        let banner = "\n=== vx launched \(ISO8601DateFormatter().string(from: Date())) ===\n"
+        var banner = "\n=== vx launched \(ISO8601DateFormatter().string(from: Date())) ===\n"
+        if profile.isHermetic {
+            banner += "[runtime/profile] \(profile.summary)\n"
+        }
         if let data = banner.data(using: .utf8) {
             fileHandle?.write(data)
         }

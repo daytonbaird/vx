@@ -27,13 +27,15 @@ private enum HUDConfig {
 
 /// Backing model shared between the window controller and SwiftUI view.
 final class DictationHUDModel: ObservableObject {
-    enum State {
+    /// Raw values are the wire names used by the JSONL event log and the `hud` test-control
+    /// command — keep them stable.
+    enum State: String, CaseIterable {
         case hidden
         case hint
         case listening
     }
 
-    enum VisualStyle: Equatable {
+    enum VisualStyle: String, CaseIterable, Equatable {
         case idle
         case recording
         case goMode
@@ -148,6 +150,7 @@ struct DictationHUD: View {
                 .buttonStyle(.plain)
                 .opacity(model.visualStyle == .success ? 0 : (model.controlsEnabled ? 1 : 0.35))
                 .allowsHitTesting(model.visualStyle != .success && model.controlsEnabled)
+                .accessibilityIdentifier(AXID.hudCancel)
 
                 Group {
                     if model.visualStyle == .processing {
@@ -172,6 +175,7 @@ struct DictationHUD: View {
                 .buttonStyle(.plain)
                 .opacity(model.visualStyle == .success ? 0 : (model.controlsEnabled ? 1 : 0.35))
                 .allowsHitTesting(model.visualStyle != .success && model.controlsEnabled)
+                .accessibilityIdentifier(AXID.hudStop)
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
@@ -211,6 +215,7 @@ struct DictationHUD: View {
                     .background(.ultraThinMaterial)
                     .clipShape(Capsule())
                     .transition(.opacity)
+                    .accessibilityIdentifier(AXID.hudStatus)
             } else if model.visualStyle == .success {
                 Text("Inserted")
                     .font(.system(size: 11, weight: .medium))
@@ -220,6 +225,7 @@ struct DictationHUD: View {
                     .background(.ultraThinMaterial)
                     .clipShape(Capsule())
                     .transition(.opacity)
+                    .accessibilityIdentifier(AXID.hudStatus)
             }
         }
         .scaleEffect(reduceMotion ? 1 : (hasAppeared ? 1 : HUDConfig.scaleIn))
@@ -517,6 +523,14 @@ final class DictationHUDController {
         didSet { window.backgroundColor = isDebugMode ? NSColor.red.withAlphaComponent(0.3) : .clear }
     }
 
+    /// Called once per distinct (state, visual style) transition, on the main thread.
+    /// Wired to the JSONL event log by default; the coordinator may override it.
+    var onStateChange: ((DictationHUDModel.State, DictationHUDModel.VisualStyle) -> Void)?
+
+    /// Current appearance, for the `state` test-control command.
+    var currentState: DictationHUDModel.State { model.state }
+    var currentVisualStyle: DictationHUDModel.VisualStyle { model.visualStyle }
+
     private let model = DictationHUDModel()
     private let hosting: NSHostingController<DictationHUD>
     private let window: DraggablePanel
@@ -526,6 +540,9 @@ final class DictationHUDController {
     private var statusWorkItem: DispatchWorkItem?
     private var activeHintIsCustom = false
     private var smoothedLevel: Double = 0
+    /// Last pair handed to `onStateChange`, so a mutation that changes neither is silent and
+    /// one that changes both fires exactly once.
+    private var lastNotified: (DictationHUDModel.State, DictationHUDModel.VisualStyle) = (.hidden, .idle)
 
     init() {
         hosting = NSHostingController(rootView: DictationHUD(model: model))
@@ -565,8 +582,98 @@ final class DictationHUDController {
             }
         }
         window.setFrameAutosaveName("DictationHUDWindow")
+        // Borderless panels draw no title bar, but the title is what makes the HUD findable
+        // through CGWindowListCopyWindowInfo, which is how a screenshot harness locates it.
+        window.title = "vx HUD"
+        window.applyAXID(AXID.hudWindow)
+        if let eventLog = EventLog.shared {
+            onStateChange = { state, style in
+                eventLog.record(kind: EventLog.Kind.hudState, [
+                    "state": state.rawValue,
+                    "style": style.rawValue,
+                ])
+            }
+        }
         positionWindow()
         hideWindow()
+    }
+
+    // MARK: - State change notification
+
+    private func notifyStateChange() {
+        let current = (model.state, model.visualStyle)
+        guard current != lastNotified else { return }
+        lastNotified = current
+        onStateChange?(current.0, current.1)
+    }
+
+    // MARK: - Test/preview control
+
+    /// Forces the HUD into `style` in the listening state, with no timers to undo it.
+    /// Used by the `hud <style>` test-control command for deterministic screenshots.
+    func preview(style: DictationHUDModel.VisualStyle) {
+        cancelHint()
+        statusWorkItem?.cancel()
+        statusWorkItem = nil
+        pendingHint = false
+        smoothedLevel = 0
+        model.onCancel = {}
+        model.onStop = {}
+        model.level = (style == .recording || style == .goMode) ? 0.5 : 0
+        model.visualStyle = style
+        model.controlsEnabled = (style != .processing && style != .success)
+        model.state = .listening
+        updateWindow(for: .listening)
+        notifyStateChange()
+    }
+
+    /// Applies the argument of a `hud <argument>` test-control command: a `VisualStyle` raw
+    /// value, `hint`, or `hide`. Returns false for an unrecognised argument.
+    @discardableResult
+    func applyHUDTestCommand(_ argument: String) -> Bool {
+        switch argument {
+        case "hint":
+            previewHint()
+        case "hide":
+            previewHidden()
+        default:
+            guard let style = DictationHUDModel.VisualStyle(rawValue: argument) else { return false }
+            preview(style: style)
+        }
+        return true
+    }
+
+    /// Shows the hint capsule immediately and leaves it up, with no timers.
+    func previewHint(_ text: String? = nil) {
+        cancelHint()
+        statusWorkItem?.cancel()
+        statusWorkItem = nil
+        pendingHint = false
+        if let text {
+            model.hintText = text
+            activeHintIsCustom = true
+        }
+        model.visualStyle = .idle
+        model.controlsEnabled = true
+        model.level = 0
+        model.state = .hint
+        updateWindow(for: .hint)
+        notifyStateChange()
+    }
+
+    /// Hides the HUD immediately, with no timers and no debug-mode fallback to the hint.
+    func previewHidden() {
+        cancelHint()
+        statusWorkItem?.cancel()
+        statusWorkItem = nil
+        smoothedLevel = 0
+        model.visualStyle = .idle
+        model.controlsEnabled = true
+        model.level = 0
+        model.state = .hidden
+        resetHintToDefaultIfNeeded()
+        updateWindow(for: .hidden)
+        notifyStateChange()
     }
 
     private var defaultHintText = "Press fn to toggle dictation"
@@ -612,6 +719,7 @@ final class DictationHUDController {
             model.state = .listening
         }
         updateWindow(for: .listening)
+        notifyStateChange()
     }
 
     func hide() {
@@ -628,6 +736,7 @@ final class DictationHUDController {
             }
             resetHintToDefaultIfNeeded()
             updateWindow(for: .hint)
+            notifyStateChange()
             return
         }
         withAnimation {
@@ -637,6 +746,7 @@ final class DictationHUDController {
             model.level = 0
         }
         resetHintToDefaultIfNeeded()
+        notifyStateChange()
         window.ignoresMouseEvents = true
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.model.state == .hidden else { return }
@@ -660,6 +770,7 @@ final class DictationHUDController {
             model.level = 0
         }
         updateWindow(for: .listening)
+        notifyStateChange()
         guard effectiveAutoHide else {
             statusWorkItem = nil
             return
@@ -672,6 +783,7 @@ final class DictationHUDController {
                 self.model.state = .hidden
             }
             self.updateWindow(for: .hidden)
+            self.notifyStateChange()
             self.statusWorkItem = nil
         }
         statusWorkItem = workItem
@@ -690,6 +802,7 @@ final class DictationHUDController {
             model.level = 0
         }
         updateWindow(for: .listening)
+        notifyStateChange()
 
         guard !isDebugMode else { return }
 
@@ -701,6 +814,7 @@ final class DictationHUDController {
                 self.model.level = 0
                 self.model.state = .hidden
             }
+            self.notifyStateChange()
             // Let exit transition run, then order out (don’t call updateWindow here).
             let orderOutItem = DispatchWorkItem { [weak self] in
                 guard let self, self.model.state == .hidden else { return }
@@ -735,6 +849,7 @@ final class DictationHUDController {
                 self.model.state = .hint
             }
             self.updateWindow(for: .hint)
+            self.notifyStateChange()
 
             let hideItem = DispatchWorkItem { [weak self] in
                 guard let self else { return }
@@ -745,6 +860,7 @@ final class DictationHUDController {
                     self.resetHintToDefaultIfNeeded()
                 }
                 self.updateWindow(for: .hidden)
+                self.notifyStateChange()
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: hideItem)
             self.hintWorkItem = hideItem

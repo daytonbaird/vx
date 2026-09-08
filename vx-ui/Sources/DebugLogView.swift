@@ -20,6 +20,7 @@ struct DebugLogView: View {
                     logger.clear()
                 }
                 .buttonStyle(.bordered)
+                .accessibilityIdentifier(AXID.debugLogClear)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -77,12 +78,17 @@ final class DebugLogController {
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.setContentSize(NSSize(width: 640, height: 400))
         window.setFrameAutosaveName("DebugLogWindow")
+        window.applyAXID(AXID.debugLogWindow)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        EventLog.shared?.record(kind: EventLog.Kind.window, ["title": window.title, "event": "opened"])
     }
 
     func close() {
+        if let window {
+            EventLog.shared?.record(kind: EventLog.Kind.window, ["title": window.title, "event": "closed"])
+        }
         window?.close()
         window = nil
     }

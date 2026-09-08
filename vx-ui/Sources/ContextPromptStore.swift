@@ -33,8 +33,7 @@ struct ContextPromptStore {
     // MARK: Paths
 
     static var promptsDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".vx/prompts")
+        RuntimeProfile.current.promptsDirectory
     }
 
     static func promptURL(contextID: String) -> URL {

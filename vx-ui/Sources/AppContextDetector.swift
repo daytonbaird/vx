@@ -266,8 +266,7 @@ struct AppContextDetector {
     // MARK: Private helpers
 
     internal static var configFileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".vx/app-contexts.yaml")
+        RuntimeProfile.current.appContextsFileURL
     }
 
     private static let defaultFileContents = """

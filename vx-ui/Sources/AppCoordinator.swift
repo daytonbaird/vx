@@ -5,15 +5,27 @@ import Combine
 import Foundation
 import SwiftUI
 
+/// Carries the replay Audio Source's "out of audio" callback to the flow. Built before the
+/// flow exists and pointed at it afterwards; the reference is weak so the flow → source →
+/// closure → relay chain never closes into a cycle.
+private final class ReplayDrainRelay {
+    weak var flow: DictationFlow?
+
+    func fire() {
+        DispatchQueue.main.async { [weak self] in
+            self?.flow?.audioSourceDidDrain()
+        }
+    }
+}
+
 @MainActor
 public final class AppCoordinator: NSObject {
     private let appState: AppState
+    /// Dictation Flow: owns the recording → transcript → inserted text path and reports
+    /// back through `DictationFlowDelegate`. Everything AppKit stays on this side.
+    private let flow: DictationFlow
     private lazy var overlay = OverlayWindow(idleMessage: idleMessage)
     private let hud = DictationHUDController()
-    private let audioCapture = AudioCapture()
-    private let transcriber = SubprocessTranscriber()
-    private let dictationProcessor = DictationProcessor()
-    private let contextResolver = DictationContextResolver()
     private let preferencesController = PreferencesController()
     private let debugLogController = DebugLogController()
     private let historyController = TranscriptionHistoryController()
@@ -33,10 +45,6 @@ public final class AppCoordinator: NSObject {
     private var modeMenuItems: [DictationMode: NSMenuItem] = [:]
     private var profileMenuItem: NSMenuItem?
     private var profileMenuItems: [CodeProfile: NSMenuItem] = [:]
-    /// Bundle ID, name, and PID of the frontmost app at the moment recording began.
-    private var recordingTargetBundleID: String?
-    private var recordingTargetAppName: String?
-    private var recordingTargetPID: pid_t = 0
     private var shortcutMonitor: GlobalShortcutMonitor?
     private var doubleTapMonitor: DoubleTapMonitor?
     private var modifierMonitor: ModifierKeyMonitor?
@@ -44,18 +52,12 @@ public final class AppCoordinator: NSObject {
     private var goModeShortcutMonitor: GlobalShortcutMonitor?
     private var goModeDoubleTapMonitor: DoubleTapMonitor?
     private var goModeModifierMonitor: ModifierKeyMonitor?
-    private var transcriptionTask: Task<Void, Never>?
-    private var goModeProcessingTasks: [UUID: Task<Void, Never>] = [:]
-    private var currentRecordingURL: URL?
-    private var activeStream: TranscriptionSession?
-    private var goModeSegmenter: GoModeSegmenter?
-    private var goModeCaptureURL: URL?
-    private var goModeTargetBundleID: String?
-    private var goModeTargetAppName: String?
-    private var goModeTargetPID: pid_t = 0
-    private var isRecording = false
-    private var isGoModeActive = false
+    /// Output was Bluetooth when the current capture began, so the duck is deferred until
+    /// `.recordingStarted` (see the ordering note in `flow(_:didEmit:)`).
+    private var deferredBluetoothDuck = false
     private var cancellables = Set<AnyCancellable>()
+    /// Live only when `VX_TEST_CONTROL` names a socket path.
+    private var testControlServer: TestControlServer?
     private var accessibilityAlertShown = false
     private var escapeGlobalMonitor: Any?
     private var escapeLocalMonitor: Any?
@@ -77,9 +79,73 @@ public final class AppCoordinator: NSObject {
         }
     }
 
-    public init(appState: AppState) {
+    /// Production wiring: builds the real Dictation Flow dependencies (microphone, vx-rs
+    /// subprocess, pasteboard inserter, shared history) around `appState`.
+    public convenience init(appState: AppState) {
+        // The replay source has to tell the flow it ran out of audio, but the flow does not
+        // exist until the dependencies are built — the relay closes that loop and holds the
+        // flow weakly, so the flow's ownership of the source stays acyclic.
+        let drainRelay = ReplayDrainRelay()
+        let audioSource: AudioSource
+        if let replayURL = RuntimeProfile.current.audioSourceURL {
+            vxLog("[coordinator/init] audio source: replay \(replayURL.path)")
+            audioSource = WAVFileAudioSource(
+                url: replayURL,
+                pacing: .realtime,
+                onDrained: { drainRelay.fire() }
+            )
+        } else {
+            audioSource = AudioCapture()
+        }
+
+        let dependencies = DictationFlow.Dependencies(
+            audioSource: audioSource,
+            transcriber: SubprocessTranscriber(),
+            processor: DictationProcessor(),
+            contextResolver: DictationContextResolver(),
+            textInserter: PasteboardTextInserter(),
+            history: TranscriptionHistory.shared,
+            settings: {
+                DictationSettings(
+                    backendURL: appState.backendURL,
+                    modelURL: appState.modelURL,
+                    inputDeviceUID: appState.selectedInputDeviceUID,
+                    autoDetectMode: appState.autoDetectMode,
+                    manualMode: appState.currentMode,
+                    manualProfile: appState.currentCodeProfile,
+                    spokenSubmitPhrases: appState.spokenSubmitPhrases,
+                    goModeSubmitDelay: appState.goModeSubmitDelay,
+                    postProcessing: { ruleContext, goMode in
+                        AppCoordinator.makePostProcessingConfig(
+                            appState: appState,
+                            ruleContext: ruleContext,
+                            enabled: goMode ? appState.usePostProcessingInGoMode : true
+                        )
+                    }
+                )
+            },
+            frontmostApp: {
+                guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+                return TargetApp(
+                    bundleID: app.bundleIdentifier,
+                    name: app.localizedName,
+                    pid: app.processIdentifier
+                )
+            },
+            validateResources: { backendURL, modelURL in
+                try FileValidator.validate(backendURL: backendURL, modelURL: modelURL)
+            }
+        )
+        let flow = DictationFlow(dependencies: dependencies)
+        drainRelay.flow = flow
+        self.init(appState: appState, flow: flow)
+    }
+
+    init(appState: AppState, flow: DictationFlow) {
         self.appState = appState
+        self.flow = flow
         super.init()
+        flow.delegate = self
         setupStatusItem()
         setupShortcut()
         setupCopyLastShortcut()
@@ -116,13 +182,38 @@ public final class AppCoordinator: NSObject {
             let pct = Int(fraction * 100)
             self?.updateMenuView?.setState(.result("Downloading… \(pct)%"))
         }
-        Task {
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            updateChecker.checkForUpdates()
+        if RuntimeProfile.current.disableUpdateCheck {
+            vxLog("[coordinator/init] update check disabled by runtime profile")
+        } else {
+            Task {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                updateChecker.checkForUpdates()
+            }
+        }
+        startTestControlServerIfConfigured()
+        EventLog.shared?.record(kind: EventLog.Kind.launched, [
+            "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev",
+            "pid": String(getpid()),
+        ])
+    }
+
+    /// Opens the Unix-domain command socket when `VX_TEST_CONTROL` names one. A failure here
+    /// is never fatal — the app runs exactly as it would without the channel, and the log
+    /// line is the only way a harness learns the socket will never appear.
+    private func startTestControlServerIfConfigured() {
+        guard let socketPath = RuntimeProfile.current.testControlSocketPath else { return }
+        let server = TestControlServer(socketPath: socketPath, handler: self)
+        do {
+            try server.start()
+            testControlServer = server
+        } catch {
+            vxLog("[test-control] could not listen at \(socketPath): \(error)")
         }
     }
 
     public func invalidate() {
+        testControlServer?.stop()
+        testControlServer = nil
         shortcutMonitor?.stop()
         doubleTapMonitor?.stop()
         modifierMonitor?.stop()
@@ -130,9 +221,7 @@ public final class AppCoordinator: NSObject {
         goModeShortcutMonitor?.stop()
         goModeDoubleTapMonitor?.stop()
         goModeModifierMonitor?.stop()
-        transcriptionTask?.cancel()
-        for task in goModeProcessingTasks.values { task.cancel() }
-        goModeSegmenter?.stop(finishActive: false)
+        flow.invalidate()
         FnKeyTap.shared.deactivate()
     }
 
@@ -216,7 +305,7 @@ public final class AppCoordinator: NSObject {
             }
             .store(in: &cancellables)
 
-        audioCapture.levelPublisher
+        flow.audioSource.levelPublisher
             .sink { [weak self] in self?.hud.updateLevel($0) }
             .store(in: &cancellables)
 
@@ -329,7 +418,7 @@ public final class AppCoordinator: NSObject {
         case .combo(let keyCode, let modifiers):
             let monitor = GlobalShortcutMonitor(keyCode: keyCode, modifiers: modifiers) { [weak self] event in
                 guard event == .keyDown else { return }
-                DispatchQueue.main.async { self?.toggleGoMode() }
+                DispatchQueue.main.async { self?.flow.toggleGoMode() }
             }
             monitor.start()
             goModeShortcutMonitor = monitor
@@ -337,7 +426,7 @@ public final class AppCoordinator: NSObject {
         case .doubleTap(let modifier):
             let monitor = DoubleTapMonitor(modifier: modifier) { [weak self] event in
                 guard event == .keyDown else { return }
-                DispatchQueue.main.async { self?.toggleGoMode() }
+                DispatchQueue.main.async { self?.flow.toggleGoMode() }
             }
             monitor.start()
             goModeDoubleTapMonitor = monitor
@@ -345,7 +434,7 @@ public final class AppCoordinator: NSObject {
         case .modifier(let modifier):
             let monitor = ModifierKeyMonitor(modifier: modifier) { [weak self] event in
                 guard event == .keyDown else { return }
-                DispatchQueue.main.async { self?.toggleGoMode() }
+                DispatchQueue.main.async { self?.flow.toggleGoMode() }
             }
             monitor.start()
             goModeModifierMonitor = monitor
@@ -357,6 +446,7 @@ public final class AppCoordinator: NSObject {
         item.button?.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "vx")
         item.button?.imagePosition = .imageOnly
         item.button?.alphaValue = 0.55
+        item.button?.setAccessibilityIdentifier(AXID.statusItem)
 
         let menu = NSMenu()
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
@@ -373,12 +463,15 @@ public final class AppCoordinator: NSObject {
 
         menu.addItem(withTitle: "Preferences", action: #selector(openPreferences), keyEquivalent: "")
         menu.items.last?.target = self
+        menu.items.last?.setAccessibilityIdentifier(AXID.menuPreferences)
 
         // Mode submenu
         let modeItem = NSMenuItem(title: "Mode", action: nil, keyEquivalent: "")
+        modeItem.setAccessibilityIdentifier(AXID.menuMode)
         let modeSubmenu = NSMenu(title: "Mode")
         let autoItem = NSMenuItem(title: "Auto-detect", action: #selector(toggleAutoDetectMode), keyEquivalent: "")
         autoItem.target = self
+        autoItem.setAccessibilityIdentifier(AXID.menuModeAuto)
         autoItem.state = appState.autoDetectMode ? .on : .off
         modeSubmenu.addItem(autoItem)
         autoDetectModeMenuItem = autoItem
@@ -387,6 +480,7 @@ public final class AppCoordinator: NSObject {
             let item = NSMenuItem(title: mode.displayName, action: #selector(setDictationMode(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = mode
+            item.setAccessibilityIdentifier(AXID.menuMode(mode))
             item.state = (!appState.autoDetectMode && appState.currentMode == mode) ? .on : .off
             modeSubmenu.addItem(item)
             modeMenuItems[mode] = item
@@ -397,11 +491,13 @@ public final class AppCoordinator: NSObject {
 
         // Code Profile submenu — visible always, enabled only in code mode
         let profileItem = NSMenuItem(title: "Code Profile", action: nil, keyEquivalent: "")
+        profileItem.setAccessibilityIdentifier(AXID.menuProfile)
         let profileSubmenu = NSMenu(title: "Code Profile")
         for profile in CodeProfile.allCases {
             let item = NSMenuItem(title: profile.displayName, action: #selector(setCodeProfile(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = profile
+            item.setAccessibilityIdentifier(AXID.menuProfile(profile))
             item.state = appState.currentCodeProfile == profile ? .on : .off
             profileSubmenu.addItem(item)
             profileMenuItems[profile] = item
@@ -413,6 +509,7 @@ public final class AppCoordinator: NSObject {
 
         let historyItem = NSMenuItem(title: "History", action: nil, keyEquivalent: "")
         historyItem.submenu = NSMenu(title: "History")
+        historyItem.setAccessibilityIdentifier(AXID.menuHistory)
         menu.addItem(historyItem)
         historyMenuItem = historyItem
         menu.addItem(NSMenuItem.separator())
@@ -420,13 +517,19 @@ public final class AppCoordinator: NSObject {
         let updateView = UpdateMenuItemView(frame: NSRect(x: 0, y: 0, width: 220, height: 22))
         updateView.onTrigger = { [weak self] in self?.triggerUpdateCheck() }
         updateItem.view = updateView
+        // The row is a custom view, so the identifier goes on both: the item is what AppKit
+        // menu queries see, the view is what the accessibility tree walks.
+        updateItem.setAccessibilityIdentifier(AXID.menuUpdate)
+        updateView.setAccessibilityIdentifier(AXID.menuUpdate)
         menu.addItem(updateItem)
         updateMenuView = updateView
         menu.addItem(withTitle: "Relaunch vx", action: #selector(relaunchApp), keyEquivalent: "")
         menu.items.last?.target = self
+        menu.items.last?.setAccessibilityIdentifier(AXID.menuRelaunch)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "Quit vx", action: #selector(quit), keyEquivalent: "")
         menu.items.last?.target = self
+        menu.items.last?.setAccessibilityIdentifier(AXID.menuQuit)
 
         menu.delegate = self
         item.menu = menu
@@ -441,12 +544,12 @@ public final class AppCoordinator: NSObject {
             let success: Bool
             if appState.activationMode == .holdToTalk {
                 success = FnKeyTap.shared.activate(
-                    onPress: { [weak self] in self?.beginRecording() },
-                    onRelease: { [weak self] in self?.finishRecording() }
+                    onPress: { [weak self] in self?.flow.beginRecording() },
+                    onRelease: { [weak self] in self?.flow.finishRecording() }
                 )
             } else {
                 success = FnKeyTap.shared.activate(
-                    onPress: { [weak self] in self?.toggleRecording() },
+                    onPress: { [weak self] in self?.flow.toggleRecording() },
                     onRelease: { }
                 )
             }
@@ -456,9 +559,9 @@ public final class AppCoordinator: NSObject {
             let monitor = GlobalShortcutMonitor(keyCode: keyCode, modifiers: modifiers) { [weak self] event in
                 guard let self else { return }
                 switch (self.appState.activationMode, event) {
-                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.beginRecording() }
-                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.finishRecording() }
-                case (.toggle,     .keyDown): DispatchQueue.main.async { self.toggleRecording() }
+                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.flow.beginRecording() }
+                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.flow.finishRecording() }
+                case (.toggle,     .keyDown): DispatchQueue.main.async { self.flow.toggleRecording() }
                 case (.toggle,     .keyUp):   break
                 }
             }
@@ -469,7 +572,7 @@ public final class AppCoordinator: NSObject {
             // Double-tap is toggle-only; AppState guarantees it never pairs with hold-to-talk.
             let monitor = DoubleTapMonitor(modifier: modifier) { [weak self] event in
                 guard event == .keyDown else { return }
-                DispatchQueue.main.async { self?.toggleRecording() }
+                DispatchQueue.main.async { self?.flow.toggleRecording() }
             }
             monitor.start()
             doubleTapMonitor = monitor
@@ -478,9 +581,9 @@ public final class AppCoordinator: NSObject {
             let monitor = ModifierKeyMonitor(modifier: modifier) { [weak self] event in
                 guard let self else { return }
                 switch (self.appState.activationMode, event) {
-                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.beginRecording() }
-                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.finishRecording() }
-                case (.toggle,     .keyDown): DispatchQueue.main.async { self.toggleRecording() }
+                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.flow.beginRecording() }
+                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.flow.finishRecording() }
+                case (.toggle,     .keyDown): DispatchQueue.main.async { self.flow.toggleRecording() }
                 case (.toggle,     .keyUp):   break
                 }
             }
@@ -489,19 +592,20 @@ public final class AppCoordinator: NSObject {
         }
     }
 
-    private func toggleRecording() {
-        if isRecording {
-            finishRecording()
-        } else {
-            beginRecording()
-        }
+    /// One JSONL record per user-triggered action, so a harness can assert "the menu item
+    /// did what it says" without scraping the human-readable log. `value` carries the raw
+    /// value the action selected, and is empty for actions that select nothing.
+    private func recordMenuAction(_ action: String, value: String = "") {
+        EventLog.shared?.record(kind: EventLog.Kind.menuAction, ["action": action, "value": value])
     }
 
     @objc private func openPreferences() {
+        recordMenuAction("openPreferences")
         preferencesController.show(appState: appState)
     }
 
     @objc private func openHistory() {
+        recordMenuAction("openHistory")
         historyController.show()
     }
 
@@ -537,6 +641,7 @@ public final class AppCoordinator: NSObject {
     }
 
     @objc private func relaunchApp() {
+        recordMenuAction("relaunchApp")
         let bundlePath = Bundle.main.bundleURL.path
         let task = Process()
         task.launchPath = "/bin/sh"
@@ -546,6 +651,7 @@ public final class AppCoordinator: NSObject {
     }
 
     @objc private func copyLastTranscription() {
+        recordMenuAction("copyLastTranscription")
         guard let text = TranscriptionHistory.shared.entries.first?.text else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -553,7 +659,13 @@ public final class AppCoordinator: NSObject {
         hud.showHint("Copied to clipboard", after: 0.0, duration: 1.5)
     }
 
-    private func makePostProcessingConfig(ruleContext: RuleContext, enabled: Bool) -> PostProcessingConfig? {
+    /// Builds the optional LLM post-processing config from `AppState`. Static so the
+    /// production `DictationSettings` snapshot can call it before `self` exists.
+    private static func makePostProcessingConfig(
+        appState: AppState,
+        ruleContext: RuleContext,
+        enabled: Bool
+    ) -> PostProcessingConfig? {
         guard enabled,
               appState.isPostProcessingEnabled,
               !appState.postProcessingAPIKey.isEmpty else { return nil }
@@ -575,11 +687,14 @@ public final class AppCoordinator: NSObject {
     }
 
     @objc private func toggleAutoDetectMode() {
-        appState.autoDetectMode.toggle()
+        let enabled = !appState.autoDetectMode
+        recordMenuAction("toggleAutoDetectMode", value: String(enabled))
+        appState.autoDetectMode = enabled
     }
 
     @objc private func setDictationMode(_ sender: NSMenuItem) {
         guard let mode = sender.representedObject as? DictationMode else { return }
+        recordMenuAction("setDictationMode", value: mode.rawValue)
         // Selecting a mode manually turns off auto-detect.
         appState.autoDetectMode = false
         appState.currentMode = mode
@@ -587,479 +702,19 @@ public final class AppCoordinator: NSObject {
 
     @objc private func setCodeProfile(_ sender: NSMenuItem) {
         guard let profile = sender.representedObject as? CodeProfile else { return }
+        recordMenuAction("setCodeProfile", value: profile.rawValue)
         appState.currentCodeProfile = profile
     }
 
     @objc private func toggleDebugMode() {
-        appState.isDebugMode.toggle()
+        let enabled = !appState.isDebugMode
+        recordMenuAction("toggleDebugMode", value: String(enabled))
+        appState.isDebugMode = enabled
     }
 
     @objc private func quit() {
+        recordMenuAction("quit")
         NSApp.terminate(nil)
-    }
-
-    private func beginRecording() {
-        guard !isRecording else { return }
-        if isGoModeActive {
-            stopGoMode(finishActive: false)
-        }
-
-        // Capture the frontmost app before the HUD shows. The HUD is a
-        // non-activating panel so focus stays on the target app, but we store
-        // the bundle ID now so finishRecording() can use it without a race.
-        let targetApp = NSWorkspace.shared.frontmostApplication
-        recordingTargetBundleID = targetApp?.bundleIdentifier
-        recordingTargetAppName = targetApp?.localizedName
-        recordingTargetPID = targetApp?.processIdentifier ?? 0
-
-        let backendURL = appState.backendURL
-        let modelURL = appState.modelURL
-
-        do {
-            try FileValidator.validate(backendURL: backendURL, modelURL: modelURL)
-        } catch {
-            logFailure(error.localizedDescription, dismissAfter: 2.0)
-            return
-        }
-
-        // AudioObjectSetPropertyData on a Bluetooth output device races with AVAudioEngine's
-        // installTap and causes an uncatchable NSException. Duck non-BT devices before engine
-        // setup (so the fade starts immediately on key press); for BT, defer until after
-        // engine.start() when the tap is already installed and the race window is closed.
-        let duckEnabled = appState.duckAudioWhileRecording
-        let bluetoothOutput = AudioCapture.isBluetoothDefaultOutput()
-        if duckEnabled && !bluetoothOutput {
-            let t0 = Date()
-            volumeController.duck(to: Float(appState.duckVolume))
-            vxLog("[coordinator/beginRecording] duck: \(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
-        }
-
-        // Launch the streaming vx-rs session before starting the engine so audio arrives
-        // from the very first tap callback. There is no file-mode fallback: if the session
-        // can't start, the backend is genuinely broken, so surface it and abort.
-        let stream: TranscriptionSession
-        do {
-            stream = try transcriber.begin(model: modelURL)
-        } catch {
-            if duckEnabled && !bluetoothOutput { volumeController.restore() }
-            vxLog("[coordinator/beginRecording] Streaming launch failed: \(error.localizedDescription)")
-            logFailure(error.localizedDescription, dismissAfter: 2.0)
-            return
-        }
-
-        // Start the audio engine, retrying a few times. When a Bluetooth output device
-        // (e.g. WH-1000XM3) flips between A2DP and HFP/SCO as input capture begins,
-        // engine.start() intermittently fails with kAudioUnitErr_FormatNotSupported (-10868).
-        // A short settle delay plus a fresh engine usually succeeds, and each failed attempt
-        // tears itself down cleanly (AudioCapture.startRecording), so retries don't leak or
-        // wedge CoreAudio.
-        let engineStartTime = Date()
-        let maxAttempts = 3
-        var startError: Error?
-        var started = false
-        for attempt in 1...maxAttempts {
-            do {
-                currentRecordingURL = try audioCapture.startRecording(
-                    deviceUID: appState.selectedInputDeviceUID,
-                    session: stream
-                )
-                started = true
-                if attempt > 1 { vxLog("[coordinator/beginRecording] start succeeded on attempt \(attempt)/\(maxAttempts)") }
-                break
-            } catch {
-                startError = error
-                vxLog("[coordinator/beginRecording] start attempt \(attempt)/\(maxAttempts) failed: \(error.localizedDescription)")
-                if attempt < maxAttempts { Thread.sleep(forTimeInterval: 0.25) }
-            }
-        }
-
-        if started {
-            // Engine is running and tap is installed — safe to duck BT devices now.
-            if duckEnabled && bluetoothOutput {
-                let t0 = Date()
-                volumeController.duck(to: Float(appState.duckVolume))
-                vxLog("[coordinator/beginRecording] duck (BT, post-engine): \(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
-            }
-            activeStream = stream
-            vxLog("[coordinator/beginRecording] startRecording: \(String(format: "%.1f", Date().timeIntervalSince(engineStartTime) * 1000))ms")
-            isRecording = true
-            if appState.soundEffectsEnabled { soundPlayer.play("start.mp3") }
-            updateStatusItemAppearance(isActive: true)
-            installEscapeMonitorIfNeeded()
-            hud.showListening(
-                onCancel: { [weak self] in self?.cancelRecording() },
-                onStop: { [weak self] in self?.finishRecording() }
-            )
-        } else {
-            // Couldn't start after retries — kill the streaming process and undo any duck.
-            stream.cancel()
-            if duckEnabled { volumeController.restore() }
-            vxLog("[coordinator/beginRecording] giving up after \(maxAttempts) attempts: \(startError?.localizedDescription ?? "unknown error")")
-            logFailure("Couldn’t start the microphone. If you’re on Bluetooth headphones it may be switching audio modes — try again in a moment.", dismissAfter: 3.0)
-        }
-
-        vxLog("[coordinator/beginRecording] Backend: \(backendURL.path)")
-        vxLog("[coordinator/beginRecording] Model: \(modelURL.path)")
-    }
-
-    private func finishRecording() {
-        guard isRecording else { return }
-        isRecording = false
-        removeEscapeMonitor()
-        updateStatusItemAppearance(isActive: false)
-
-        // Play before stopping the engine — on Bluetooth devices (AirPods) the device
-        // transitions from SCO/HFP back to A2DP after engine.stop(), and during that
-        // handoff the device reports as muted, silencing any sound played after stop.
-        if appState.soundEffectsEnabled { soundPlayer.play("transcribe.mp3") }
-
-        // Stop engine first — engine.stop() blocks the main thread while audio buffers
-        // drain. Starting the restore fade after teardown means the timer fires cleanly
-        // without that blocking window interfering.
-        let stopStart = Date()
-        let recordingURL = audioCapture.stopRecording() ?? currentRecordingURL
-        vxLog("[coordinator/finishRecording] stopRecording: \(String(format: "%.1f", Date().timeIntervalSince(stopStart) * 1000))ms")
-        currentRecordingURL = nil
-
-        if appState.duckAudioWhileRecording {
-            let t0 = Date()
-            volumeController.restore()
-            vxLog("[coordinator/finishRecording] restore: \(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
-        }
-
-        guard let recordingURL else {
-            logFailure("No audio captured.", dismissAfter: 2.0)
-            return
-        }
-
-        hud.flashStatus(.processing, duration: 1.5, autoHide: false)
-
-        transcriptionTask?.cancel()
-        let transcribeStart = Date()
-        let capturedStream = activeStream
-        activeStream = nil
-        // Install escape monitor for the processing phase so the user can bail
-        // while transcription is running (works for both hold-to-talk and toggle).
-        installProcessingEscapeMonitor()
-        transcriptionTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                guard let stream = capturedStream else {
-                    // Recording only starts once a live session exists, so this is unreachable
-                    // in practice; treat a lost session as a surfaced failure rather than crash.
-                    try? FileManager.default.removeItem(at: recordingURL)
-                    await MainActor.run {
-                        self.removeEscapeMonitor()
-                        self.logFailure("Transcription session was lost.", dismissAfter: 2.0)
-                    }
-                    return
-                }
-                // Closing stdin triggers final inference in vx-rs.
-                let text = try await stream.finish()
-                vxLog("[coordinator/finishRecording] stream finish: \(String(format: "%.1f", Date().timeIntervalSince(transcribeStart) * 1000))ms")
-                // No WAV file to clean up in streaming mode.
-                try? FileManager.default.removeItem(at: recordingURL)
-
-                guard !Task.isCancelled else { return }
-
-                // Resolve the dictation context for this recording session. When auto-detect
-                // is enabled, the frontmost app's bundle ID (captured at beginRecording time)
-                // is mapped to a mode/profile; a no-match falls back to the manual selection.
-                let resolved = self.contextResolver.resolve(
-                    autoDetect: self.appState.autoDetectMode,
-                    bundleID: self.recordingTargetBundleID,
-                    pid: self.recordingTargetPID,
-                    manualMode: self.appState.currentMode,
-                    manualProfile: self.appState.currentCodeProfile
-                )
-                let detectedContext = resolved.detectedContext
-                let ruleContext = resolved.ruleContext
-                let submitTargetContext = self.recordingTargetBundleID.map {
-                    AppContextDetector.detect(bundleID: $0, pid: self.recordingTargetPID)
-                }
-                if let ctx = detectedContext {
-                    vxLog("[coordinator/finishRecording] Auto-detected context: \(ctx.displayName) for \(self.recordingTargetBundleID ?? "unknown")")
-                }
-                // Assemble the optional post-processing config from AppState.
-                let postProcessing = self.makePostProcessingConfig(ruleContext: ruleContext, enabled: true)
-                let spokenSubmitCommand = SpokenSubmitCommandDetector.detect(
-                    in: text,
-                    phrases: self.appState.spokenSubmitPhrases
-                )
-                let textForProcessing = spokenSubmitCommand.shouldSubmit ? spokenSubmitCommand.textToInsert : text
-
-                // Sanitize → rules → (optional) post-process, all behind one interface.
-                // .noSpeech means nothing real survived sanitization or post-processing.
-                let session = DictationSession(
-                    mode: ruleContext.mode,
-                    codeProfile: ruleContext.codeProfile,
-                    postProcessing: postProcessing
-                )
-                let processingOutcome: DictationOutcome
-                if spokenSubmitCommand.shouldSubmit, textForProcessing.isEmpty {
-                    processingOutcome = .noSpeech
-                } else {
-                    processingOutcome = await self.dictationProcessor.process(textForProcessing, session: session)
-                }
-
-                let finalText: String
-                let pipelineResult: TransformationResult?
-                switch processingOutcome {
-                case .text(let output, let result):
-                    finalText = output
-                    pipelineResult = result
-                case .noSpeech:
-                    guard spokenSubmitCommand.shouldSubmit else {
-                        vxLog("[coordinator/finishRecording] No speech after processing, raw: \(text.debugDescription)")
-                        await MainActor.run {
-                            self.removeEscapeMonitor()
-                            self.logFailure("No speech detected.", dismissAfter: 2.0)
-                        }
-                        return
-                    }
-                    finalText = ""
-                    pipelineResult = nil
-                }
-                guard !Task.isCancelled else { return }
-                let profileSuffix = ruleContext.mode == .code ? "/\(ruleContext.codeProfile.rawValue)" : ""
-                vxLog("[coordinator/finishRecording] Mode: \(ruleContext.mode.rawValue)\(profileSuffix), rules loaded: \(pipelineResult?.ruleCount ?? 0), transformed: \(pipelineResult?.didTransform ?? false)")
-                await MainActor.run {
-                    self.contextDebugController.model.updateLastRecording(
-                        bundleID: self.recordingTargetBundleID,
-                        appName: self.recordingTargetAppName,
-                        context: detectedContext,
-                        mode: ruleContext.mode,
-                        ruleCount: pipelineResult?.ruleCount ?? 0
-                    )
-                }
-
-                await MainActor.run {
-                    self.removeEscapeMonitor()
-                    do {
-                        let submitBehavior = GoModeSubmitStrategy.behavior(
-                            targetContext: submitTargetContext,
-                            ruleContext: ruleContext
-                        )
-                        if spokenSubmitCommand.shouldSubmit {
-                            vxLog("[coordinator/finishRecording] Spoken submit detected, behavior: \(submitBehavior.logName), inserted text empty: \(finalText.isEmpty)")
-                            if finalText.isEmpty {
-                                TextInserter.submit(behavior: submitBehavior)
-                            } else {
-                                try TextInserter.insert(finalText, submitBehavior: submitBehavior)
-                                TranscriptionHistory.shared.append(finalText)
-                            }
-                        } else {
-                            try TextInserter.insert(finalText)
-                            TranscriptionHistory.shared.append(finalText)
-                        }
-                        self.hud.completeProcessing()
-                    } catch {
-                        self.logFailure(error.localizedDescription, dismissAfter: 2.5)
-                    }
-                }
-            } catch {
-                try? FileManager.default.removeItem(at: recordingURL)
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    self.removeEscapeMonitor()
-                    self.logFailure(error.localizedDescription, dismissAfter: 2.5)
-                }
-            }
-        }
-    }
-
-    private func cancelRecording() {
-        guard isRecording else { return }
-        isRecording = false
-        removeEscapeMonitor()
-        updateStatusItemAppearance(isActive: false)
-        activeStream?.cancel()
-        activeStream = nil
-        if let url = audioCapture.stopRecording() ?? currentRecordingURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-        currentRecordingURL = nil
-        if appState.duckAudioWhileRecording {
-            volumeController.restore()
-        }
-        hud.flashStatus(.cancelled, duration: 1.0)
-    }
-
-    private func toggleGoMode() {
-        if isGoModeActive {
-            stopGoMode(finishActive: true)
-        } else {
-            startGoMode()
-        }
-    }
-
-    private func startGoMode() {
-        guard !isGoModeActive, !isRecording else { return }
-
-        let targetApp = NSWorkspace.shared.frontmostApplication
-        goModeTargetBundleID = targetApp?.bundleIdentifier
-        goModeTargetAppName = targetApp?.localizedName
-        goModeTargetPID = targetApp?.processIdentifier ?? 0
-
-        let backendURL = appState.backendURL
-        let modelURL = appState.modelURL
-
-        do {
-            try FileValidator.validate(backendURL: backendURL, modelURL: modelURL)
-        } catch {
-            logFailure(error.localizedDescription, dismissAfter: 2.0)
-            return
-        }
-
-        let segmenter = GoModeSegmenter(
-            transcriber: transcriber,
-            modelURL: modelURL,
-            onTranscript: { [weak self] text in
-                self?.processGoModeTranscript(text)
-            },
-            onFailure: { [weak self] error in
-                guard let self else { return }
-                self.logFailure(error.localizedDescription, dismissAfter: 2.5)
-                self.stopGoMode(finishActive: false)
-            }
-        )
-
-        let startTime = Date()
-        let maxAttempts = 3
-        var startError: Error?
-        var started = false
-        for attempt in 1...maxAttempts {
-            do {
-                goModeCaptureURL = try audioCapture.startRecording(
-                    deviceUID: appState.selectedInputDeviceUID,
-                    sampleSink: { [weak segmenter] samples in
-                        segmenter?.ingest(samples: samples)
-                    }
-                )
-                started = true
-                if attempt > 1 { vxLog("[go-mode/start] capture succeeded on attempt \(attempt)/\(maxAttempts)") }
-                break
-            } catch {
-                startError = error
-                vxLog("[go-mode/start] capture attempt \(attempt)/\(maxAttempts) failed: \(error.localizedDescription)")
-                if attempt < maxAttempts { Thread.sleep(forTimeInterval: 0.25) }
-            }
-        }
-
-        guard started else {
-            segmenter.stop(finishActive: false)
-            logFailure("Couldn’t start Go mode microphone capture: \(startError?.localizedDescription ?? "unknown error")", dismissAfter: 3.0)
-            return
-        }
-
-        goModeSegmenter = segmenter
-        isGoModeActive = true
-        updateStatusItemAppearance(isActive: true)
-        installGoModeEscapeMonitor()
-        if appState.soundEffectsEnabled { soundPlayer.play("start.mp3") }
-        hud.showListening(
-            style: .goMode,
-            onCancel: { [weak self] in self?.stopGoMode(finishActive: false) },
-            onStop: { [weak self] in self?.stopGoMode(finishActive: true) }
-        )
-        vxLog("[go-mode/start] Active: capture \(String(format: "%.1f", Date().timeIntervalSince(startTime) * 1000))ms")
-        vxLog("[go-mode/start] Backend: \(backendURL.path)")
-        vxLog("[go-mode/start] Model: \(modelURL.path)")
-    }
-
-    private func stopGoMode(finishActive: Bool) {
-        guard isGoModeActive || goModeSegmenter != nil else { return }
-        isGoModeActive = false
-        removeEscapeMonitor()
-        updateStatusItemAppearance(isActive: isRecording)
-
-        goModeSegmenter?.stop(finishActive: finishActive)
-        goModeSegmenter = nil
-
-        if let url = audioCapture.stopRecording() ?? goModeCaptureURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-        goModeCaptureURL = nil
-
-        if finishActive {
-            hud.hide()
-            vxLog("[go-mode/stop] Stopped")
-        } else {
-            for task in goModeProcessingTasks.values { task.cancel() }
-            goModeProcessingTasks.removeAll()
-            hud.flashStatus(.cancelled, duration: 1.0)
-            vxLog("[go-mode/stop] Cancelled")
-        }
-    }
-
-    private func processGoModeTranscript(_ rawText: String) {
-        let taskID = UUID()
-        let task = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                Task { @MainActor [weak self] in
-                    self?.goModeProcessingTasks[taskID] = nil
-                }
-            }
-
-            let targetApp = NSWorkspace.shared.frontmostApplication
-            let targetBundleID = targetApp?.bundleIdentifier ?? self.goModeTargetBundleID
-            let targetPID = targetApp?.processIdentifier ?? self.goModeTargetPID
-            let targetAppName = targetApp?.localizedName ?? self.goModeTargetAppName ?? "unknown"
-            let targetContext = targetBundleID.map { AppContextDetector.detect(bundleID: $0, pid: targetPID) }
-            let resolved = self.contextResolver.resolve(
-                autoDetect: self.appState.autoDetectMode,
-                bundleID: targetBundleID,
-                pid: targetPID,
-                manualMode: self.appState.currentMode,
-                manualProfile: self.appState.currentCodeProfile
-            )
-            let ruleContext = resolved.ruleContext
-            let postProcessing = self.makePostProcessingConfig(
-                ruleContext: ruleContext,
-                enabled: self.appState.usePostProcessingInGoMode
-            )
-            let session = DictationSession(
-                mode: ruleContext.mode,
-                codeProfile: ruleContext.codeProfile,
-                postProcessing: postProcessing
-            )
-
-            guard case .text(let finalText, let pipelineResult) = await self.dictationProcessor.process(rawText, session: session) else {
-                vxLog("[go-mode/process] No speech after processing, raw: \(rawText.debugDescription)")
-                return
-            }
-            guard !Task.isCancelled else { return }
-
-            let profileSuffix = ruleContext.mode == .code ? "/\(ruleContext.codeProfile.rawValue)" : ""
-            vxLog("[go-mode/process] Mode: \(ruleContext.mode.rawValue)\(profileSuffix), rules loaded: \(pipelineResult.ruleCount), transformed: \(pipelineResult.didTransform)")
-
-            let submitDelay = min(max(self.appState.goModeSubmitDelay, 0), 2)
-            if submitDelay > 0 {
-                vxLog("[go-mode/submit] Waiting \(String(format: "%.2f", submitDelay))s before submit")
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(submitDelay * 1_000_000_000))
-                } catch {
-                    return
-                }
-                guard !Task.isCancelled else { return }
-            }
-
-            await MainActor.run {
-                do {
-                    let submitBehavior = GoModeSubmitStrategy.behavior(
-                        targetContext: targetContext,
-                        ruleContext: ruleContext
-                    )
-                    vxLog("[go-mode/submit] Target: \(targetAppName) (\(targetBundleID ?? "unknown")), context: \(targetContext?.displayName ?? "unknown"), behavior: \(submitBehavior.logName)")
-                    try TextInserter.insert(finalText, submitBehavior: submitBehavior)
-                    TranscriptionHistory.shared.append(finalText)
-                } catch {
-                    self.logFailure(error.localizedDescription, dismissAfter: 2.5)
-                }
-            }
-        }
-        goModeProcessingTasks[taskID] = task
     }
 
     private func updateStatusItemAppearance(isActive: Bool) {
@@ -1091,8 +746,8 @@ public final class AppCoordinator: NSObject {
         let handler: (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return event }
             DispatchQueue.main.async {
-                guard let self, self.isRecording else { return }
-                self.cancelRecording()
+                guard let self, self.flow.isRecording else { return }
+                self.flow.cancelRecording()
             }
             return nil
         }
@@ -1101,8 +756,8 @@ public final class AppCoordinator: NSObject {
         escapeGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return }
             DispatchQueue.main.async {
-                guard let self, self.isRecording else { return }
-                self.cancelRecording()
+                guard let self, self.flow.isRecording else { return }
+                self.flow.cancelRecording()
             }
         }
     }
@@ -1113,8 +768,8 @@ public final class AppCoordinator: NSObject {
         let handler: (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return event }
             DispatchQueue.main.async {
-                guard let self, self.isGoModeActive else { return }
-                self.stopGoMode(finishActive: false)
+                guard let self, self.flow.isGoModeActive else { return }
+                self.flow.stopGoMode(finishActive: false)
             }
             return nil
         }
@@ -1123,8 +778,8 @@ public final class AppCoordinator: NSObject {
         escapeGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return }
             DispatchQueue.main.async {
-                guard let self, self.isGoModeActive else { return }
-                self.stopGoMode(finishActive: false)
+                guard let self, self.flow.isGoModeActive else { return }
+                self.flow.stopGoMode(finishActive: false)
             }
         }
     }
@@ -1148,8 +803,8 @@ public final class AppCoordinator: NSObject {
         let handler: (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return event }
             DispatchQueue.main.async {
-                guard let self, self.transcriptionTask != nil else { return }
-                self.cancelTranscription()
+                guard let self, self.flow.isTranscribing else { return }
+                self.flow.cancelTranscription()
             }
             return nil
         }
@@ -1158,19 +813,10 @@ public final class AppCoordinator: NSObject {
         escapeGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return }
             DispatchQueue.main.async {
-                guard let self, self.transcriptionTask != nil else { return }
-                self.cancelTranscription()
+                guard let self, self.flow.isTranscribing else { return }
+                self.flow.cancelTranscription()
             }
         }
-    }
-
-    /// Cancels an in-progress transcription task (called by the processing-phase escape monitor).
-    private func cancelTranscription() {
-        vxLog("[coordinator/cancelTranscription] Transcription cancelled by user")
-        transcriptionTask?.cancel()
-        transcriptionTask = nil
-        removeEscapeMonitor()
-        hud.flashStatus(.cancelled, duration: 1.0)
     }
 
     private func requestMicrophonePermission() {
@@ -1200,7 +846,266 @@ public final class AppCoordinator: NSObject {
     }
 }
 
-private enum FileValidator {
+// MARK: - DictationFlowDelegate
+
+/// Turns Flow Events into everything AppKit: ducking, sounds, the HUD, the status item,
+/// escape monitors, and the context inspector. The flow itself touches none of these.
+extension AppCoordinator: DictationFlowDelegate {
+    func flow(_ flow: DictationFlow, didEmit event: DictationFlowEvent) {
+        vxLog("[flow/event] \(event.name)")
+        EventLog.shared?.record(event)
+
+        switch event {
+        case .captureWillStart(let goMode):
+            handleCaptureWillStart(goMode: goMode)
+
+        case .recordingStarted:
+            // Capture is running and the tap is installed — safe to duck Bluetooth now.
+            if deferredBluetoothDuck {
+                deferredBluetoothDuck = false
+                let t0 = Date()
+                volumeController.duck(to: Float(appState.duckVolume))
+                vxLog("[coordinator/beginRecording] duck (BT, post-engine): \(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
+            }
+            if appState.soundEffectsEnabled { soundPlayer.play("start.mp3") }
+            updateStatusItemAppearance(isActive: true)
+            installEscapeMonitorIfNeeded()
+            hud.showListening(
+                onCancel: { [weak self] in self?.flow.cancelRecording() },
+                onStop: { [weak self] in self?.flow.finishRecording() }
+            )
+
+        case .recordingWillStop:
+            // Play before the source stops — on Bluetooth devices (AirPods) the device
+            // transitions from SCO/HFP back to A2DP after teardown, and during that
+            // handoff the device reports as muted, silencing any sound played after stop.
+            if appState.soundEffectsEnabled { soundPlayer.play("transcribe.mp3") }
+
+        case .transcribing:
+            removeEscapeMonitor()
+            updateStatusItemAppearance(isActive: false)
+            if appState.duckAudioWhileRecording {
+                let t0 = Date()
+                volumeController.restore()
+                vxLog("[coordinator/finishRecording] restore: \(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
+            }
+            hud.flashStatus(.processing, duration: 1.5, autoHide: false)
+            // Install the escape monitor for the processing phase so the user can bail
+            // while transcription is running (works for both hold-to-talk and toggle).
+            installProcessingEscapeMonitor()
+
+        case .transcriptReceived:
+            break
+
+        case .processed(let mode, _, _, let ruleCount, _):
+            guard !flow.eventContext.goMode else { break }
+            let context = flow.eventContext
+            contextDebugController.model.updateLastRecording(
+                bundleID: context.target?.bundleID,
+                appName: context.target?.name,
+                context: context.detectedContext,
+                mode: DictationMode(rawValue: mode) ?? appState.currentMode,
+                ruleCount: ruleCount
+            )
+
+        case .textInserted, .submittedWithoutText:
+            guard !flow.eventContext.goMode else { break }
+            removeEscapeMonitor()
+            hud.completeProcessing()
+
+        case .noSpeech:
+            guard !flow.eventContext.goMode else { break }
+            removeEscapeMonitor()
+            logFailure("No speech detected.", dismissAfter: 2.0)
+
+        case .failed(let message):
+            deferredBluetoothDuck = false
+            if !flow.eventContext.goMode {
+                removeEscapeMonitor()
+                if appState.duckAudioWhileRecording { volumeController.restore() }
+            }
+            logFailure(message, dismissAfter: flow.lastFailureDismissAfter)
+
+        case .cancelled:
+            deferredBluetoothDuck = false
+            removeEscapeMonitor()
+            updateStatusItemAppearance(isActive: false)
+            if appState.duckAudioWhileRecording { volumeController.restore() }
+            hud.flashStatus(.cancelled, duration: 1.0)
+
+        case .goModeStarted:
+            updateStatusItemAppearance(isActive: true)
+            installGoModeEscapeMonitor()
+            if appState.soundEffectsEnabled { soundPlayer.play("start.mp3") }
+            hud.showListening(
+                style: .goMode,
+                onCancel: { [weak self] in self?.flow.stopGoMode(finishActive: false) },
+                onStop: { [weak self] in self?.flow.stopGoMode(finishActive: true) }
+            )
+
+        case .goModeStopped(let cancelled):
+            removeEscapeMonitor()
+            updateStatusItemAppearance(isActive: flow.isRecording)
+            if cancelled {
+                hud.flashStatus(.cancelled, duration: 1.0)
+            } else {
+                hud.hide()
+            }
+
+        case .audioSourceDrained:
+            break
+        }
+    }
+
+    /// AudioObjectSetPropertyData on a Bluetooth output device races with AVAudioEngine's
+    /// installTap and causes an uncatchable NSException. Duck non-BT devices before engine
+    /// setup (so the fade starts immediately on key press); for BT, defer until after
+    /// capture is running, when the tap is already installed and the race window is closed.
+    /// Go mode never ducks.
+    private func handleCaptureWillStart(goMode: Bool) {
+        deferredBluetoothDuck = false
+        guard !goMode, appState.duckAudioWhileRecording else { return }
+        if AudioCapture.isBluetoothDefaultOutput() {
+            deferredBluetoothDuck = true
+        } else {
+            let t0 = Date()
+            volumeController.duck(to: Float(appState.duckVolume))
+            vxLog("[coordinator/beginRecording] duck: \(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
+        }
+    }
+}
+
+// MARK: - TestControlHandler
+
+extension AppCoordinator: TestControlHandler {
+
+    /// Snapshot returned by the `state` command. Encoded with sorted keys so a harness can
+    /// diff two replies byte for byte.
+    private struct ControlState: Encodable {
+        struct HUD: Encodable {
+            let state: String
+            let style: String
+        }
+
+        let isRecording: Bool
+        let isGoModeActive: Bool
+        let isTranscribing: Bool
+        let hud: HUD
+        let mode: String
+        let profile: String
+        let autoDetect: Bool
+    }
+
+    /// Performs one Test Control Channel command. Always on the main thread, and never
+    /// reachable unless `VX_TEST_CONTROL` opened the socket in the first place.
+    public func handle(_ command: TestControlCommand) -> TestControlReply {
+        switch command {
+        case .ping:
+            return .ok
+
+        case .state:
+            return stateReply()
+
+        case .begin:
+            flow.beginRecording()
+            return .ok
+
+        case .finish:
+            flow.finishRecording()
+            return .ok
+
+        case .cancel:
+            flow.cancelRecording()
+            return .ok
+
+        case .toggle:
+            flow.toggleRecording()
+            return .ok
+
+        case .goStart:
+            flow.startGoMode()
+            return .ok
+
+        case .goStop:
+            flow.stopGoMode(finishActive: true)
+            return .ok
+
+        case .goCancel:
+            flow.stopGoMode(finishActive: false)
+            return .ok
+
+        case .hud(let argument):
+            guard hud.applyHUDTestCommand(argument) else {
+                return .error("unknown hud style '\(argument)'")
+            }
+            return .ok
+
+        case .open(let surface, let tab):
+            return openSurface(surface, tab: tab)
+
+        case .quit:
+            // Reply first: terminating inside the handler would tear the socket down before
+            // the client ever reads the "ok".
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+            return .ok
+        }
+    }
+
+    private func stateReply() -> TestControlReply {
+        let snapshot = ControlState(
+            isRecording: flow.isRecording,
+            isGoModeActive: flow.isGoModeActive,
+            isTranscribing: flow.isTranscribing,
+            hud: ControlState.HUD(
+                state: hud.currentState.rawValue,
+                style: hud.currentVisualStyle.rawValue
+            ),
+            mode: appState.currentMode.rawValue,
+            profile: appState.currentCodeProfile.rawValue,
+            autoDetect: appState.autoDetectMode
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(snapshot),
+              let json = String(data: data, encoding: .utf8) else {
+            return .error("could not encode state")
+        }
+        return .okJSON(json)
+    }
+
+    private func openSurface(_ surface: String, tab: String?) -> TestControlReply {
+        switch surface {
+        case "preferences":
+            if let tab {
+                guard PreferencesView.allTabIDs.contains(tab) else {
+                    return .error("unknown preferences tab '\(tab)'")
+                }
+                // Set before showing so a first open picks the tab up in `onAppear`, and an
+                // already-open window picks it up through the publisher.
+                appState.requestedPreferencesTab = tab
+            }
+            openPreferences()
+            return .ok
+
+        case "history":
+            openHistory()
+            return .ok
+
+        case "debugLog":
+            NotificationCenter.default.post(name: .vxShowDebugLog, object: nil)
+            return .ok
+
+        case "contextInspector":
+            contextDebugController.show(appState: appState)
+            return .ok
+
+        default:
+            return .error("unknown window '\(surface)'")
+        }
+    }
+}
+
+enum FileValidator {
     static func validate(backendURL: URL, modelURL: URL) throws {
         let fm = FileManager.default
         let backendPath = backendURL.path
@@ -1234,9 +1139,11 @@ private final class PreferencesController {
         window.minSize = NSSize(width: 480, height: 460)
         window.setContentSize(NSSize(width: 480, height: 600))
         window.center()
+        window.applyAXID(AXID.prefsWindow)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        EventLog.shared?.record(kind: EventLog.Kind.window, ["title": window.title, "event": "opened"])
     }
 }
 
@@ -1304,12 +1211,13 @@ extension AppCoordinator: NSMenuDelegate {
             empty.isEnabled = false
             submenu.addItem(empty)
         } else {
-            for entry in entries {
+            for (index, entry) in entries.enumerated() {
                 let maxLen = 40
                 let preview = entry.text.count > maxLen ? String(entry.text.prefix(maxLen)) + "…" : entry.text
                 let item = NSMenuItem(title: preview, action: #selector(copyHistoryEntry(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = entry.text
+                item.setAccessibilityIdentifier(AXID.menuHistoryEntry(index))
                 submenu.addItem(item)
             }
         }
@@ -1317,10 +1225,12 @@ extension AppCoordinator: NSMenuDelegate {
         submenu.addItem(NSMenuItem.separator())
         let showAll = NSMenuItem(title: "Show All", action: #selector(openHistory), keyEquivalent: "")
         showAll.target = self
+        showAll.setAccessibilityIdentifier(AXID.menuHistoryShowAll)
         submenu.addItem(showAll)
     }
 
     @objc private func copyHistoryEntry(_ sender: NSMenuItem) {
+        recordMenuAction("copyHistoryEntry")
         guard let text = sender.representedObject as? String else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)

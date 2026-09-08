@@ -293,12 +293,17 @@ final class ContextDebugController {
         win.styleMask = [.titled, .closable, .miniaturizable]
         win.setContentSize(NSSize(width: 340, height: 480))
         win.setFrameAutosaveName("ContextInspectorWindow")
+        win.applyAXID(AXID.contextInspectorWindow)
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.window = win
+        EventLog.shared?.record(kind: EventLog.Kind.window, ["title": win.title, "event": "opened"])
     }
 
     func close() {
+        if let window {
+            EventLog.shared?.record(kind: EventLog.Kind.window, ["title": window.title, "event": "closed"])
+        }
         window?.close()
         window = nil
     }

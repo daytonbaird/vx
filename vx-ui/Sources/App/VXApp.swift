@@ -4,16 +4,31 @@ import Foundation
 import VXLib
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let appState = AppState()
+    let appState = AppState(defaults: RuntimeProfile.current.defaults)
     private var coordinator: AppCoordinator?
     private let watchdogQueue = DispatchQueue(label: "com.vx.watchdog")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        ignoreSIGPIPE()
         logEnvironmentDiagnostics()
         NSApp.setActivationPolicy(.accessory)
         setupMainMenu()
         coordinator = AppCoordinator(appState: appState)
         startMainThreadWatchdog()
+    }
+
+    /// Writing to a pipe whose reader has gone away raises SIGPIPE, whose default
+    /// disposition kills the process outright — no crash log, no alert, the menu-bar
+    /// icon simply disappears.
+    ///
+    /// vx streams audio into the vx-rs subprocess's stdin continuously while recording,
+    /// so any backend that dies mid-take (a corrupt or missing binary, an OOM kill, a
+    /// model it cannot load) takes the whole app down with it. Ignoring the signal turns
+    /// that into an ordinary `EPIPE` write error, which `StreamingTranscription.finish()`
+    /// already knows how to surface: a non-zero exit becomes `TranscriberError.processFailed`,
+    /// which reaches the user as an error HUD instead of a vanished app.
+    private func ignoreSIGPIPE() {
+        signal(SIGPIPE, SIG_IGN)
     }
 
     /// Safety net for a wedged main thread. vx is an accessory (menu-bar) app, so a hung

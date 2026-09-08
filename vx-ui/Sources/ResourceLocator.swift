@@ -93,9 +93,8 @@ public enum ResourceLocator {
         // the user models directory rather than crashing the app on launch. Return the
         // expected path even if it doesn't exist yet; callers that need a real file check
         // existence (and ModelManager handles downloading).
-        let userModels = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("vx/\(modelSubdirectory)/\(name).\(modelExtension)")
+        let userModels: URL? = RuntimeProfile.current.userModelsDirectory
+            .appendingPathComponent("\(name).\(modelExtension)")
         if let userModels {
             if FileManager.default.fileExists(atPath: userModels.path) {
                 cachedModelURL = userModels

@@ -97,6 +97,11 @@ public final class AppState: ObservableObject {
     /// AppState when it has to adjust a binding; the UI presents and clears it.
     @Published var shortcutNotice: String?
 
+    /// A one-shot request to show a particular Preferences tab, by tab id
+    /// (`config|rules|ai|sound|permissions|developer`). Never persisted: the Preferences
+    /// view consumes it and sets it back to nil, so it is a message, not a setting.
+    @Published public var requestedPreferencesTab: String?
+
     @Published var isDebugMode: Bool {
         didSet { defaults.set(isDebugMode, forKey: "vx.debug-mode") }
     }
@@ -208,11 +213,14 @@ public final class AppState: ObservableObject {
         didSet { defaults.set(selectedModelName, forKey: "vx.selected-model") }
     }
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private let shortcutKey = "vx.shortcut"
     private let activationKey = "vx.activation-mode"
 
-    public init() {
+    /// - Parameter defaults: Backing store for persisted settings. Tests pass a throwaway
+    ///   suite so they never touch (or leak into) the user's real preferences.
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         shortcut = AppState.loadShortcut(from: defaults.string(forKey: shortcutKey))
         activationMode = ActivationMode(rawValue: defaults.string(forKey: activationKey) ?? "") ?? .holdToTalk
         isDebugMode = defaults.bool(forKey: "vx.debug-mode")

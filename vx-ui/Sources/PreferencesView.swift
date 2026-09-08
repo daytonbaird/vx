@@ -75,6 +75,10 @@ struct PreferencesView: View {
         ("code/rust",          "Code / Rust"),
     ]
 
+    /// Every tab id the window can show, including the normally hidden Developer tab.
+    /// The test-control channel validates `open preferences:<tab>` against this.
+    static let allTabIDs = ["config", "rules", "ai", "sound", "permissions", "developer"]
+
     private var tabs: [(id: String, icon: String, label: String)] {
         var result: [(id: String, icon: String, label: String)] = [
             ("config",      "gear",            "Configuration"),
@@ -108,6 +112,7 @@ struct PreferencesView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier(AXID.prefsTab(tab.id))
                 }
             }
             .background(Color(nsColor: .windowBackgroundColor))
@@ -133,6 +138,21 @@ struct PreferencesView: View {
             availableAudioDevices = AudioCapture.availableInputDevices()
             loadPromptFile(contextID: selectedPromptContext)
             loadMappings()
+            applyRequestedTab(appState.requestedPreferencesTab)
+        }
+        .onReceive(appState.$requestedPreferencesTab) { applyRequestedTab($0) }
+    }
+
+    /// Consumes `AppState.requestedPreferencesTab`. Selecting the Developer tab also reveals
+    /// it, since it is normally hidden behind the version-tap gesture.
+    private func applyRequestedTab(_ requested: String?) {
+        guard let requested, Self.allTabIDs.contains(requested) else { return }
+        if requested == "developer" { showDeveloperTab = true }
+        selectedTab = requested
+        // Clear on the next turn: writing the published value straight back inside the
+        // sink would mutate state SwiftUI is in the middle of reading.
+        DispatchQueue.main.async {
+            if appState.requestedPreferencesTab == requested { appState.requestedPreferencesTab = nil }
         }
     }
 
@@ -173,6 +193,7 @@ struct PreferencesView: View {
                         }
                         .labelsHidden()
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier(AXID.prefsConfigInputDevice)
 
                         Button {
                             availableAudioDevices = AudioCapture.availableInputDevices()
@@ -194,6 +215,7 @@ struct PreferencesView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
+                    .accessibilityIdentifier(AXID.prefsConfigActivationMode)
                 }
                 .alert("Shortcut reset", isPresented: Binding(
                     get: { appState.shortcutNotice != nil },
@@ -213,6 +235,7 @@ struct PreferencesView: View {
                         Button("Change…") {
                             captureShortcut()
                         }
+                        .accessibilityIdentifier(AXID.prefsConfigShortcutChange)
                     }
                     Text(appState.activationMode == .holdToTalk ? "Hold the keys to dictate." : "Press once to start, press again to stop.")
                         .foregroundStyle(.secondary)
@@ -234,6 +257,7 @@ struct PreferencesView: View {
                         Button("Change…") {
                             captureShortcutForCopy()
                         }
+                        .accessibilityIdentifier(AXID.prefsConfigCopyShortcutChange)
                     }
                     Text("Copies your most recent transcription to the clipboard.")
                         .foregroundStyle(.secondary)
@@ -249,6 +273,7 @@ struct PreferencesView: View {
                         Button("Change…") {
                             captureShortcutForGoMode()
                         }
+                        .accessibilityIdentifier(AXID.prefsConfigGoModeShortcutChange)
                     }
                     Text("Toggles continuous listening. Each completed utterance is inserted and submitted with Return.")
                         .foregroundStyle(.secondary)
@@ -257,6 +282,7 @@ struct PreferencesView: View {
                         Text("Submit delay")
                             .foregroundStyle(.secondary)
                         Slider(value: $appState.goModeSubmitDelay, in: 0...2, step: 0.05)
+                            .accessibilityIdentifier(AXID.prefsConfigSubmitDelay)
                         Text(String(format: "%.2fs", appState.goModeSubmitDelay))
                             .frame(width: 56, alignment: .trailing)
                             .monospacedDigit()
@@ -324,6 +350,7 @@ struct PreferencesView: View {
                                 onCancel: { modelManager.cancelDownload(for: model) },
                                 onRemove: { modelManager.remove(model, activeModelId: appState.selectedModelName) }
                             )
+                            .accessibilityIdentifier(AXID.prefsConfigModelRow(model.id))
                             if index < WhisperModel.catalog.count - 1 {
                                 Divider().padding(.leading, 32)
                             }
@@ -365,6 +392,7 @@ struct PreferencesView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .accessibilityIdentifier(AXID.prefsRulesMode)
                     .onChange(of: appState.currentMode) { _ in
                         tryRulesResult = nil
                         rulesReloadStatus = nil
@@ -387,6 +415,7 @@ struct PreferencesView: View {
                         }
                         .labelsHidden()
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier(AXID.prefsRulesProfile)
                         .onChange(of: appState.currentCodeProfile) { _ in
                             tryRulesResult = nil
                             rulesReloadStatus = nil
@@ -413,6 +442,7 @@ struct PreferencesView: View {
                             reloadRules()
                         }
                         .buttonStyle(.bordered)
+                        .accessibilityIdentifier(AXID.prefsRulesReload)
                         .help("Clears the rule cache so edits to YAML files take effect immediately.")
                     }
 
@@ -467,6 +497,7 @@ struct PreferencesView: View {
                                     }
                                 HStack(spacing: 8) {
                                     Button("Save") { saveRuleFile() }
+                                        .accessibilityIdentifier(AXID.prefsRulesSave)
                                         .buttonStyle(.borderedProminent)
                                         .disabled(!ruleFileIsDirty)
                                     if let status = ruleSaveStatus {
@@ -585,6 +616,7 @@ struct PreferencesView: View {
                             applyTryRules()
                         }
                         .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier(AXID.prefsRulesApply)
                         .disabled(tryRulesInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         if let result = tryRulesResult {
@@ -787,6 +819,7 @@ struct PreferencesView: View {
                     Text("Context Detection")
                         .font(.headline)
                     Toggle("Automatically detect app context", isOn: $appState.autoDetectMode)
+                        .accessibilityIdentifier(AXID.prefsAIAutoDetect)
                     Text("Detects the frontmost app (Mail, Slack, Xcode, etc.) and switches the dictation mode and AI instructions automatically.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -898,6 +931,7 @@ struct PreferencesView: View {
                     Text("AI Post-processing")
                         .font(.headline)
                     Toggle("AI post-processing", isOn: $appState.isPostProcessingEnabled)
+                        .accessibilityIdentifier(AXID.prefsAIEnabled)
                     Text("Cleans up punctuation, removes filler words, and applies your instructions and dictionary after each dictation.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -905,6 +939,7 @@ struct PreferencesView: View {
 
                     Toggle("Use post-processing in Go mode", isOn: $appState.usePostProcessingInGoMode)
                         .disabled(!appState.isPostProcessingEnabled)
+                        .accessibilityIdentifier(AXID.prefsAIGoMode)
                     Text("When off, Go mode skips AI cleanup for lower latency and more predictable terminal submissions.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -917,6 +952,7 @@ struct PreferencesView: View {
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier(AXID.prefsAIProvider)
                         .onChange(of: appState.postProcessingProvider) { newProvider in
                             appState.postProcessingModel = newProvider.defaultModel
                         }
@@ -943,6 +979,7 @@ struct PreferencesView: View {
                                 }
                             }
                             .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier(AXID.prefsAIAPIKey)
 
                             Button {
                                 showAPIKey.toggle()
@@ -961,6 +998,7 @@ struct PreferencesView: View {
                         Divider()
 
                         Toggle("Remove filler words & smooth speech", isOn: $appState.smoothDisfluencies)
+                            .accessibilityIdentifier(AXID.prefsAISmoothDisfluencies)
                         Text("Removes um/uh and verbal tics, and cleans up stutters, false starts, and repeated phrases. Turn off for verbatim transcription.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
@@ -1219,6 +1257,7 @@ struct PreferencesView: View {
                 Text("Sound Effects")
                     .font(.headline)
                 Toggle("Play sounds during dictation", isOn: $appState.soundEffectsEnabled)
+                    .accessibilityIdentifier(AXID.prefsSoundPlaySounds)
                 Text("Plays a sound when recording starts and when transcription begins.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -1229,11 +1268,13 @@ struct PreferencesView: View {
                 Text("Volume")
                     .font(.headline)
                 Toggle("Lower volume while recording", isOn: $appState.duckAudioWhileRecording)
+                    .accessibilityIdentifier(AXID.prefsSoundDuckAudio)
                 if appState.duckAudioWhileRecording {
                     HStack(spacing: 8) {
                         Text("Volume during recording")
                             .foregroundStyle(.secondary)
                         Slider(value: $appState.duckVolume, in: 0.0...0.8)
+                            .accessibilityIdentifier(AXID.prefsSoundDuckVolume)
                         Text("\(Int(appState.duckVolume * 100))%")
                             .frame(width: 36, alignment: .trailing)
                             .monospacedDigit()
@@ -1296,11 +1337,13 @@ struct PreferencesView: View {
                 Text("Debug")
                     .font(.headline)
                 Toggle("Debug Mode", isOn: $appState.isDebugMode)
+                    .accessibilityIdentifier(AXID.prefsDeveloperDebugMode)
                 HStack(spacing: 8) {
                     Button("Show Log…") {
                         NotificationCenter.default.post(name: .vxShowDebugLog, object: nil)
                     }
                     .buttonStyle(.bordered)
+                    .accessibilityIdentifier(AXID.prefsDeveloperShowLog)
                     Button("Reveal Log File") {
                         NSWorkspace.shared.activateFileViewerSelecting(
                             [DebugLogger.shared.logFileURL]
@@ -1724,6 +1767,7 @@ private struct PermissionRow: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!primaryEnabled)
+                    .accessibilityIdentifier(AXID.prefsPermissionsRequest(title))
 
                     if let secondaryTitle, let onSecondary {
                         Button(secondaryTitle) {

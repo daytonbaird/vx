@@ -5,7 +5,10 @@ import SwiftUI
 // MARK: - Model
 
 final class TranscriptionHistory: ObservableObject {
-    static let shared = TranscriptionHistory()
+    /// Reads and writes the same defaults store as the rest of the app. With no `VX_*`
+    /// overrides that is `UserDefaults.standard`; under a hermetic profile it is the
+    /// throwaway suite, so a verification run cannot append to the real user's history.
+    static let shared = TranscriptionHistory(defaults: RuntimeProfile.current.defaults)
 
     struct Entry: Identifiable, Codable {
         var id: UUID
@@ -18,7 +21,10 @@ final class TranscriptionHistory: ObservableObject {
     private static let defaultsKey = "vx.transcription-history"
     private static let maxEntries = 50
 
-    private init() {
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
         load()
     }
 
@@ -33,11 +39,11 @@ final class TranscriptionHistory: ObservableObject {
 
     func clear() {
         entries = []
-        UserDefaults.standard.removeObject(forKey: Self.defaultsKey)
+        defaults.removeObject(forKey: Self.defaultsKey)
     }
 
     private func load() {
-        guard let data = UserDefaults.standard.data(forKey: Self.defaultsKey),
+        guard let data = defaults.data(forKey: Self.defaultsKey),
               let decoded = try? JSONDecoder().decode([Entry].self, from: data)
         else { return }
         entries = decoded
@@ -45,7 +51,7 @@ final class TranscriptionHistory: ObservableObject {
 
     private func save() {
         guard let data = try? JSONEncoder().encode(entries) else { return }
-        UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        defaults.set(data, forKey: Self.defaultsKey)
     }
 }
 
@@ -64,6 +70,7 @@ struct TranscriptionHistoryView: View {
                     history.clear()
                 }
                 .buttonStyle(.bordered)
+                .accessibilityIdentifier(AXID.historyClear)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -165,8 +172,10 @@ final class TranscriptionHistoryController {
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.setContentSize(NSSize(width: 380, height: 480))
         window.setFrameAutosaveName("TranscriptionHistoryWindow")
+        window.applyAXID(AXID.historyWindow)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        EventLog.shared?.record(kind: EventLog.Kind.window, ["title": window.title, "event": "opened"])
     }
 }

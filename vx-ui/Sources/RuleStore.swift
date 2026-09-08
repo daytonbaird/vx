@@ -55,8 +55,7 @@ final class RuleStore {
     private(set) var loadWarnings: [String: [String]] = [:]
 
     private init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        rulesDirectory = home.appendingPathComponent(".vx/rules", isDirectory: true)
+        rulesDirectory = RuntimeProfile.current.rulesDirectory
         createDefaultFilesIfNeeded()
     }
 

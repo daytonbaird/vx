@@ -29,7 +29,7 @@ enum AudioCaptureError: LocalizedError {
 private final class AudioSampleDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let level: CurrentValueSubject<Double, Never>
     private let onSamples: ([Float]) -> Void
-    private let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+    private let target = AudioLevel.mono16kFloat32
     private var converter: AVAudioConverter?
     private var loggedFormat = false
 
@@ -164,10 +164,7 @@ final class AudioCapture {
 
         if let streamingSink {
             // Streaming mode: convert to f32 16 kHz mono and push frames to the session.
-            let f32Format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                         sampleRate: 16_000,
-                                         channels: 1,
-                                         interleaved: false)!
+            let f32Format = AudioLevel.mono16kFloat32
             var converter: AVAudioConverter?
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { buffer, _ in
                 if converter == nil {
@@ -199,8 +196,8 @@ final class AudioCapture {
                     streamingSink(samples)
                 }
 
-                let power = AudioCapture.averagePower(from: buffer)
-                subject.send(AudioCapture.normalize(power: power))
+                let power = AudioLevel.averagePower(from: buffer)
+                subject.send(AudioLevel.normalize(power: power))
             }
             vxLog("[audio/startRecording] Streaming mode: pushing f32 16kHz frames to session")
         } else {
@@ -253,8 +250,8 @@ final class AudioCapture {
                     try? audioFile.write(from: outBuffer)
                 }
 
-                let power = AudioCapture.averagePower(from: buffer)
-                subject.send(AudioCapture.normalize(power: power))
+                let power = AudioLevel.averagePower(from: buffer)
+                subject.send(AudioLevel.normalize(power: power))
             }
         }
 
@@ -554,31 +551,5 @@ final class AudioCapture {
         defer { buffer.deallocate() }
         guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, buffer) == noErr else { return false }
         return buffer.assumingMemoryBound(to: AudioBufferList.self).pointee.mNumberBuffers > 0
-    }
-
-    private static func averagePower(from buffer: AVAudioPCMBuffer) -> Float {
-        guard let channelData = buffer.floatChannelData else { return -160 }
-        let channelCount = Int(buffer.format.channelCount)
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0, channelCount > 0 else { return -160 }
-        var sumOfSquares: Float = 0
-        for ch in 0..<channelCount {
-            let data = channelData[ch]
-            for i in 0..<frameCount {
-                sumOfSquares += data[i] * data[i]
-            }
-        }
-        let rms = sqrt(sumOfSquares / Float(channelCount * frameCount))
-        return rms > 0 ? 20 * log10(rms) : -160
-    }
-
-    private static func normalize(power: Float) -> Double {
-        let minDb: Double = -60
-        let maxDb: Double = -12
-        let db = Double(power)
-        if db <= minDb { return 0 }
-        if db >= maxDb { return 1 }
-        let normalized = min(max((db - minDb) / (maxDb - minDb), 0), 1)
-        return pow(normalized, 0.7)
     }
 }

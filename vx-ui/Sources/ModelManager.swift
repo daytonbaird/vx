@@ -77,9 +77,7 @@ public final class ModelManager: ObservableObject {
 
     /// The directory where downloaded models are stored.
     public static func userModelsDirectoryURL() -> URL {
-        FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("vx/Models")
+        RuntimeProfile.current.userModelsDirectory
     }
 
     // MARK: - State

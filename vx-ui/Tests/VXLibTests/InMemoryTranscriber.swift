@@ -42,8 +42,14 @@ final class InMemoryTranscriptionSession: TranscriptionSession {
 final class InMemoryTranscriber: Transcriber {
     let session: InMemoryTranscriptionSession
     var beginError: Error?
+    /// When set, `begin` hands out a fresh session instead of the shared one. Go mode
+    /// starts a separate session per utterance, so its tests need one session per segment.
+    var sessionFactory: (() -> InMemoryTranscriptionSession)?
+
     private(set) var lastModel: URL?
     private(set) var beginCount = 0
+    /// Every session handed out, in order.
+    private(set) var sessions: [InMemoryTranscriptionSession] = []
 
     init(session: InMemoryTranscriptionSession = InMemoryTranscriptionSession()) {
         self.session = session
@@ -53,6 +59,8 @@ final class InMemoryTranscriber: Transcriber {
         lastModel = model
         beginCount += 1
         if let beginError { throw beginError }
-        return session
+        let handedOut = sessionFactory?() ?? session
+        sessions.append(handedOut)
+        return handedOut
     }
 }

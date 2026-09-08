@@ -94,11 +94,39 @@ final class StreamingTranscription: TranscriptionSession {
     /// Serializes f32 frames to raw little-endian bytes and writes them to the
     /// subprocess stdin pipe. `FileHandle.write` does not block on the audio thread
     /// for a pipe with buffer space, satisfying the session's write contract.
+    ///
+    /// Uses the throwing `write(contentsOf:)` rather than the legacy `write(_:)`: the
+    /// legacy call raises an **ObjC exception** on a write error, which is uncatchable
+    /// from Swift and crashes the app. Once the backend has exited, every frame the
+    /// capture thread pushes hits `EPIPE`, so this is the normal path for a dead
+    /// backend, not an exotic one. (`SIGPIPE` itself is ignored process-wide in
+    /// `AppDelegate.ignoreSIGPIPE()`, or the signal would kill us before we got here.)
+    ///
+    /// The error is swallowed deliberately: `finish()` is what reports a broken
+    /// backend, via the subprocess's non-zero exit status. Failing here would only
+    /// race that with a less informative message, and this runs on the audio thread.
     func write(samples: [Float]) {
         guard !samples.isEmpty else { return }
         let data = samples.withUnsafeBytes { Data($0) }
-        stdinHandle.write(data)
+        do {
+            try stdinHandle.write(contentsOf: data)
+        } catch {
+            // Log once: a dead backend produces one of these per audio buffer.
+            writeFailureLock.lock()
+            let alreadyLogged = loggedWriteFailure
+            loggedWriteFailure = true
+            writeFailureLock.unlock()
+            if !alreadyLogged {
+                vxLog("[transcriber/stream] stdin write failed (backend gone?): \(error)")
+            }
+        }
     }
+
+    /// One-shot latch so a dead backend does not spam the log once per audio buffer.
+    /// Its own lock, not the shared `lock`: this runs on the audio thread, which must
+    /// not contend with the stdout reader.
+    private let writeFailureLock = NSLock()
+    private var loggedWriteFailure = false
 
     private let process: Process
     private let stderrPipe: Pipe
@@ -115,6 +143,10 @@ final class StreamingTranscription: TranscriptionSession {
     private var pendingContinuation: CheckedContinuation<String, Error>?
     // Set by onCancel if it fires before the continuation is stored.
     private var finishCancelled = false
+    // Set by handleStdoutEOF if stdout closed before finish() installed `onEOF`
+    // (a backend that dies immediately does exactly this), with the text it drained.
+    private var stdoutEOFReached = false
+    private var eofText: String?
 
     init(process: Process, stdinHandle: FileHandle, stdoutPipe: Pipe, stderrPipe: Pipe) {
         self.process = process
@@ -174,7 +206,27 @@ final class StreamingTranscription: TranscriptionSession {
                             }
                         }
                     }
+                    // Replay an EOF that already happened. A backend that exits on
+                    // launch closes stdout before anyone calls `finish()`, so its
+                    // `handleStdoutEOF` found no callback to run; without this the
+                    // continuation is never resumed and the take hangs forever.
+                    let replayEOF: (() -> Void)?
+                    if self.stdoutEOFReached, let callback = self.onEOF {
+                        let text = self.eofText ?? ""
+                        self.onEOF = nil
+                        replayEOF = { callback(text) }
+                    } else {
+                        replayEOF = nil
+                    }
                     self.lock.unlock()
+
+                    if let replayEOF {
+                        replayEOF()
+                        // stdin is already broken in this path; closing it is harmless
+                        // but pointless, and `waitUntilExit` in the callback covers us.
+                        try? self.stdinHandle.close()
+                        return
+                    }
 
                     // Close stdin — vx-rs will run final inference and exit.
                     try? self.stdinHandle.close()
@@ -253,6 +305,13 @@ final class StreamingTranscription: TranscriptionSession {
         let text = finalLines.joined(separator: " ")
         let callback = onEOF
         onEOF = nil
+        // Latch it. EOF can arrive *before* `finish()` installs `onEOF` — a backend
+        // that dies on launch (missing binary, unloadable model, OOM kill) closes
+        // stdout within milliseconds of `begin`, long before the user stops talking.
+        // Dropping the callback then left the app wedged in `transcribing` forever:
+        // spinner up, no error, no way out but quitting. `finish()` replays this.
+        stdoutEOFReached = true
+        eofText = text
         lock.unlock()
 
         callback?(text)
