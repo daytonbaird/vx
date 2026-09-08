@@ -14,3 +14,8 @@ num_cpus = "1.17"
 # shader into the binary, so no external .metallib is shipped in the app bundle.
 whisper-rs = { version = "0.15.1", features = ["metal"] }
 crossbeam-channel = "0.5"
+
+[dev-dependencies]
+# Used by the transcript contract tests to load/rewrite fixtures/audio/goldens.json.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

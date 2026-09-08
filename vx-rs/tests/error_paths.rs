@@ -1,18 +1,15 @@
-/// Integration tests for error paths: missing model, missing audio, missing stdin.
-///
-/// These tests verify that vx-rs exits with a non-zero status when given bad
-/// inputs, and exits cleanly (zero) when given empty or silent input.
-use std::process::Command;
+//! Integration tests for error paths: missing model, missing audio, missing stdin.
+//!
+//! These tests verify that vx-rs exits with a non-zero status when given bad
+//! inputs, and exits cleanly (zero) when given empty or silent input.
+//!
+//! Tests needing a real model skip when it is absent; set `VX_REQUIRE_MODEL=1` to
+//! turn those skips into failures (see `tests/common/mod.rs`).
 
-fn vxrs_bin() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_vx-rs"))
-}
+mod common;
 
-fn model_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
-        .join("vx-ui/Resources/Models/ggml-tiny.en.bin")
-}
+use common::{model_guard, vxrs_bin};
+use std::process::{Command, Stdio};
 
 #[test]
 fn file_mode_missing_model_exits_nonzero() {
@@ -25,11 +22,9 @@ fn file_mode_missing_model_exits_nonzero() {
 
 #[test]
 fn file_mode_missing_audio_exits_nonzero() {
-    let model = model_path();
-    if !model.exists() {
-        eprintln!("SKIP: model not found");
-        return;
-    }
+    require_model!(model);
+    let _guard = model_guard();
+
     let status = Command::new(vxrs_bin())
         .args(["file", model.to_str().unwrap(), "/nonexistent/audio.wav"])
         .status()
@@ -39,7 +34,6 @@ fn file_mode_missing_audio_exits_nonzero() {
 
 #[test]
 fn stream_mode_missing_model_exits_nonzero() {
-    use std::process::Stdio;
     let mut child = Command::new(vxrs_bin())
         .args(["stream", "/nonexistent/model.bin"])
         .stdin(Stdio::null())
@@ -54,13 +48,9 @@ fn stream_mode_missing_model_exits_nonzero() {
 #[test]
 fn stream_mode_rejects_a_truncated_float32_sample() {
     use std::io::Write;
-    use std::process::Stdio;
 
-    let model = model_path();
-    if !model.exists() {
-        eprintln!("SKIP: {} not found", model.display());
-        return;
-    }
+    require_model!(model);
+    let _guard = model_guard();
 
     let mut child = Command::new(vxrs_bin())
         .args(["stream", model.to_str().unwrap()])
@@ -87,12 +77,9 @@ fn stream_mode_rejects_a_truncated_float32_sample() {
 
 #[test]
 fn stream_mode_empty_stdin_exits_cleanly() {
-    use std::process::Stdio;
-    let model = model_path();
-    if !model.exists() {
-        eprintln!("SKIP: model not found");
-        return;
-    }
+    require_model!(model);
+    let _guard = model_guard();
+
     let output = Command::new(vxrs_bin())
         .args(["stream", model.to_str().unwrap()])
         .stdin(Stdio::null())
@@ -109,25 +96,12 @@ fn stream_mode_empty_stdin_exits_cleanly() {
 
 #[test]
 fn stream_mode_silence_produces_no_output() {
-    use std::io::Write;
-    use std::process::Stdio;
-    let model = model_path();
-    if !model.exists() {
-        eprintln!("SKIP: model not found");
-        return;
-    }
-    // 5 seconds of silence at 16 kHz
-    let silence: Vec<u8> = vec![0u8; 5 * 16_000 * 4]; // 4 bytes per f32
-    let mut child = Command::new(vxrs_bin())
-        .args(["stream", model.to_str().unwrap()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to launch vx-rs");
+    require_model!(model);
+    let _guard = model_guard();
 
-    child.stdin.as_mut().unwrap().write_all(&silence).ok();
-    let output = child.wait_with_output().expect("failed to wait");
+    // 5 seconds of silence at 16 kHz.
+    let silence = vec![0.0f32; 5 * 16_000];
+    let output = common::run_stream(&model, &silence);
     assert!(output.status.success(), "Silence input must exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
