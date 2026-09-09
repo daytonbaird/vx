@@ -335,8 +335,29 @@ final class GlobalShortcutMonitor {
         let flags = event.flags.intersection(relevantFlags)
         let eventKeyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
 
-        if eventKeyCode == CGKeyCode(kVK_Function) {
-            return true
+        if Shortcut.isFnKey(eventKeyCode) {
+            // Bindings store the canonical kVK_Function, but keyboards that emit
+            // the Globe key as a key rather than a modifier deliver one of the
+            // other fn keycodes here. Match those against an fn binding; a real
+            // kVK_Function press belongs to the flagsChanged path below.
+            guard keyCode == CGKeyCode(kVK_Function),
+                  eventKeyCode != CGKeyCode(kVK_Function) else { return true }
+
+            switch type {
+            case .keyDown:
+                if !isPressed {
+                    isPressed = true
+                    handler(.keyDown)
+                }
+            case .keyUp:
+                if isPressed {
+                    isPressed = false
+                    handler(.keyUp)
+                }
+            default:
+                break
+            }
+            return false
         }
 
         guard eventKeyCode == keyCode, flags == modifiers else {
@@ -615,6 +636,11 @@ final class MouseButtonMonitor {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var monitorQueue: DispatchQueue?
+    /// The run loop the source was added to. `stop()` runs on the caller's
+    /// thread, so it needs a handle on the worker's loop to tear it down;
+    /// removing the source from whatever loop happens to be current instead
+    /// would leave the worker parked in `CFRunLoopRun()` forever.
+    private var monitorRunLoop: CFRunLoop?
     private var isDown = false
 
     init(button: Int, handler: @escaping (Event) -> Void) {
@@ -651,7 +677,9 @@ final class MouseButtonMonitor {
         monitorQueue = DispatchQueue(label: "voice.vx.mousebutton", qos: .userInteractive)
         monitorQueue?.async { [weak self] in
             guard let self, let source = self.runLoopSource else { return }
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            let runLoop = CFRunLoopGetCurrent()
+            self.monitorRunLoop = runLoop
+            CFRunLoopAddSource(runLoop, source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
             CFRunLoopRun()
         }
@@ -661,13 +689,22 @@ final class MouseButtonMonitor {
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+        // A monitor can be torn down while the button is still physically held —
+        // swapping the binding, or pausing shortcuts to record a new one. Report
+        // the release so whatever the press started is not left running; the
+        // replacement monitor starts from a clean slate and never sees this up.
+        if isDown {
+            isDown = false
+            handler(.keyUp)
         }
+        if let source = runLoopSource, let runLoop = monitorRunLoop {
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFRunLoopStop(runLoop)
+        }
+        monitorRunLoop = nil
         runLoopSource = nil
         eventTap = nil
         monitorQueue = nil
-        isDown = false
     }
 
     private func handle(event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
@@ -686,7 +723,16 @@ final class MouseButtonMonitor {
         if type == .otherMouseDown, !isDown {
             isDown = true
             handler(.keyDown)
-        } else if type == .otherMouseUp, isDown {
+            return nil
+        }
+
+        if type == .otherMouseUp {
+            guard isDown else {
+                // A release with no press of ours behind it — the monitor started
+                // while the button was already held. Swallowing it would strand the
+                // button down in whatever app is focused, so let it through.
+                return Unmanaged.passUnretained(event)
+            }
             isDown = false
             handler(.keyUp)
         }
