@@ -237,11 +237,11 @@ struct PreferencesView: View {
                         }
                         .accessibilityIdentifier(AXID.prefsConfigShortcutChange)
                     }
-                    Text(appState.activationMode == .holdToTalk ? "Hold the keys to dictate." : "Press once to start, press again to stop.")
+                    Text(appState.activationMode == .holdToTalk ? "Hold the keys to dictate. Double-click to keep recording after you let go." : "Press once to start, press again to stop.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(appState.activationMode == .holdToTalk
-                         ? "Use a single modifier or a key combo (e.g. ⌘Z). Right Option stays out of the way of typing. Extra mouse buttons (Mouse 4/5) work too."
+                         ? "Use a single modifier or a key combo (e.g. ⌘Z). Right Option stays out of the way of typing. Extra mouse buttons (Mouse 4/5) work too. Double-click the shortcut to keep recording after you let go."
                          : "Use a single modifier, a double-tap of one, or a key combo. Right Option stays out of the way of typing. Extra mouse buttons (Mouse 4/5) work too.")
                         .font(.caption)
                         .foregroundStyle(.secondary)

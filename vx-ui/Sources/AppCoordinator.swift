@@ -34,6 +34,15 @@ public final class AppCoordinator: NSObject {
     private let updateChecker = UpdateChecker()
     private let soundPlayer = SoundPlayer()
     private let contextDebugController = ContextDebugController()
+    private lazy var trigger = DictationTrigger(
+        mode: { [weak self] in self?.appState.activationMode ?? .holdToTalk },
+        onBegin: { [weak self] in self?.flow.beginRecording() },
+        onFinish: { [weak self] in self?.flow.finishRecording() },
+        onToggle: { [weak self] in self?.flow.toggleRecording() },
+        onLatch: { [weak self] in
+            self?.hud.showHint("Locked — press again to stop", after: 0.0, duration: 4.0)
+        }
+    )
 
     private var statusItem: NSStatusItem?
     private var updateMenuView: UpdateMenuItemView?
@@ -227,6 +236,7 @@ public final class AppCoordinator: NSObject {
         goModeDoubleTapMonitor?.stop()
         goModeModifierMonitor?.stop()
         goModeMouseButtonMonitor?.stop()
+        trigger.reset()
         flow.invalidate()
         FnKeyTap.shared.deactivate()
     }
@@ -248,6 +258,7 @@ public final class AppCoordinator: NSObject {
 
         NotificationCenter.default.publisher(for: .vxPauseShortcut)
             .sink { [weak self] _ in
+                self?.trigger.reset()
                 self?.shortcutMonitor?.stop()
                 self?.shortcutMonitor = nil
                 self?.doubleTapMonitor?.stop()
@@ -388,6 +399,7 @@ public final class AppCoordinator: NSObject {
     }
 
     private func restartShortcutMonitor() {
+        trigger.reset()
         shortcutMonitor?.stop()
         shortcutMonitor = nil
         doubleTapMonitor?.stop()
@@ -578,28 +590,17 @@ public final class AppCoordinator: NSObject {
 
         switch appState.shortcut {
         case .combo(let keyCode, _) where keyCode == CGKeyCode(kVK_Function):
-            let success: Bool
-            if appState.activationMode == .holdToTalk {
-                success = FnKeyTap.shared.activate(
-                    onPress: { [weak self] in self?.flow.beginRecording() },
-                    onRelease: { [weak self] in self?.flow.finishRecording() }
-                )
-            } else {
-                success = FnKeyTap.shared.activate(
-                    onPress: { [weak self] in self?.flow.toggleRecording() },
-                    onRelease: { }
-                )
-            }
+            let success = FnKeyTap.shared.activate(
+                onPress: { [weak self] in self?.trigger.press() },
+                onRelease: { [weak self] in self?.trigger.release() }
+            )
             if !success { promptForAccessibilityPermission() }
 
         case .combo(let keyCode, let modifiers):
             let monitor = GlobalShortcutMonitor(keyCode: keyCode, modifiers: modifiers) { [weak self] event in
-                guard let self else { return }
-                switch (self.appState.activationMode, event) {
-                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.flow.beginRecording() }
-                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.flow.finishRecording() }
-                case (.toggle,     .keyDown): DispatchQueue.main.async { self.flow.toggleRecording() }
-                case (.toggle,     .keyUp):   break
+                switch event {
+                case .keyDown: self?.trigger.press()
+                case .keyUp:   self?.trigger.release()
                 }
             }
             monitor.start()
@@ -616,12 +617,9 @@ public final class AppCoordinator: NSObject {
 
         case .modifier(let modifier):
             let monitor = ModifierKeyMonitor(modifier: modifier) { [weak self] event in
-                guard let self else { return }
-                switch (self.appState.activationMode, event) {
-                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.flow.beginRecording() }
-                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.flow.finishRecording() }
-                case (.toggle,     .keyDown): DispatchQueue.main.async { self.flow.toggleRecording() }
-                case (.toggle,     .keyUp):   break
+                switch event {
+                case .keyDown: self?.trigger.press()
+                case .keyUp:   self?.trigger.release()
                 }
             }
             monitor.start()
@@ -629,12 +627,9 @@ public final class AppCoordinator: NSObject {
 
         case .mouseButton(let button):
             let monitor = MouseButtonMonitor(button: button) { [weak self] event in
-                guard let self else { return }
-                switch (self.appState.activationMode, event) {
-                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.flow.beginRecording() }
-                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.flow.finishRecording() }
-                case (.toggle,     .keyDown): DispatchQueue.main.async { self.flow.toggleRecording() }
-                case (.toggle,     .keyUp):   break
+                switch event {
+                case .keyDown: self?.trigger.press()
+                case .keyUp:   self?.trigger.release()
                 }
             }
             monitor.start()
@@ -791,7 +786,7 @@ public final class AppCoordinator: NSObject {
     }
 
     private func installEscapeMonitorIfNeeded() {
-        guard appState.activationMode == .toggle, escapeGlobalMonitor == nil, escapeLocalMonitor == nil else { return }
+        guard escapeGlobalMonitor == nil, escapeLocalMonitor == nil else { return }
 
         let handler: (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return event }
