@@ -150,6 +150,34 @@ final class DictationTriggerTests: XCTestCase {
         XCTAssertEqual(finishCount, 0)
     }
 
+    func testClearLatchLetsTheNextPressStartRecordingAgain() {
+        // Escape and the HUD's cancel button end the recording without going through the
+        // trigger. Unless the latch is cleared, the next press is spent turning it off and
+        // the user has to press twice to start recording again.
+        let beganTwice = expectation(description: "began twice")
+        var beginCount = 0
+        var finishCount = 0
+        let trigger = makeTrigger(
+            onBegin: {
+                beginCount += 1
+                if beginCount == 2 { beganTwice.fulfill() }
+            },
+            onFinish: { finishCount += 1 }
+        )
+
+        trigger.press()
+        trigger.release()
+        DispatchQueue.main.asyncAfter(deadline: .now() + doubleTapWindow / 2) {
+            trigger.press()          // latches
+            trigger.release()
+            trigger.clearLatch()     // stands in for Escape cancelling the recording
+            trigger.press()          // must begin, not be eaten as a stop
+        }
+
+        wait(for: [beganTwice], timeout: 1)
+        XCTAssertEqual(finishCount, 0, "clearLatch must not end anything itself")
+    }
+
     func testResetWhileAShortPressIsStillWaitingToStopFinishesIt() {
         // The press began a recording and the stop is deferred waiting on a possible second
         // press. Resetting drops that deferred stop, so it has to finish the recording itself

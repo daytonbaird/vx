@@ -55,6 +55,19 @@ final class DictationTrigger {
         }
     }
 
+    /// Forgets a latch and any deferred stop without ending anything, for when the
+    /// recording was already ended by something other than the shortcut — Escape, the HUD's
+    /// own stop or cancel button. `reset()` is the wrong call there: it would report a
+    /// release for a recording that has already gone away.
+    func clearLatch() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.cancelPendingStop()
+            self.pressTime = nil
+            self.isLatched = false
+        }
+    }
+
     private func handlePress() {
         guard mode() == .holdToTalk else {
             onToggle()
