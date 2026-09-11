@@ -39,6 +39,7 @@ Set the dictation shortcut in **Preferences → Configuration → Shortcut**. Yo
 - a single modifier, held or double-tapped (Right Option stays clear of typing)
 - the `fn` / 🌐 key
 - an extra mouse button — Mouse 4, Mouse 5, or any higher side button
+- in hold-to-talk mode, double-click any shortcut to keep recording until you press it again
 
 Mouse 4 and 5 are usually the thumb buttons that act as Back and Forward. vx
 swallows the button it is bound to, so it stops navigating history while it is
