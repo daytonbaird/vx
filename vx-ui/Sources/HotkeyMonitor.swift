@@ -79,12 +79,29 @@ enum Shortcut: Equatable {
     /// duration of dictation in hold-to-talk mode, or pressed to flip recording
     /// on/off in toggle mode.
     case modifier(ModifierKey)
+    /// An extra mouse button identified by its raw CoreGraphics button number.
+    case mouseButton(Int)
+
+    /// Buttons 0-2 are left, right and middle. Binding those would swallow the
+    /// clicks the app itself needs — including the ones required to reach
+    /// Preferences and pick a different shortcut — so only the side buttons and
+    /// above can be bound.
+    static let minimumBindableMouseButton = 3
+
+    /// Keycodes the fn/Globe key can arrive as. Which one a Mac emits depends on
+    /// the keyboard and the "Press 🌐 to" setting, so all of them normalise to
+    /// kVK_Function and every layer above sees a single representation.
+    static let fnKeycodes: Set<Int> = [kVK_Function, 179, 193, 103]
+
+    static func isFnKey(_ keyCode: CGKeyCode) -> Bool {
+        fnKeycodes.contains(Int(keyCode))
+    }
 
     /// Convenience initialiser matching the old struct API.
     /// Handles the fn-key modifier promotion automatically.
     init(keyCode: CGKeyCode, modifiers: CGEventFlags) {
-        if keyCode == CGKeyCode(kVK_Function) {
-            self = .combo(keyCode: keyCode, modifiers: modifiers.union(.maskSecondaryFn))
+        if Shortcut.isFnKey(keyCode) {
+            self = .combo(keyCode: CGKeyCode(kVK_Function), modifiers: modifiers.union(.maskSecondaryFn))
         } else if Shortcut.isFunctionKey(keyCode) {
             // On Macs where the function row defaults to media keys, F1…F20 only emit
             // their key code while fn is held, so the captured flags carry fn. That's an
@@ -112,6 +129,8 @@ enum Shortcut: Equatable {
             return modifier.displayName
         case .modifier(let modifier):
             return modifier.singleDisplayName
+        case .mouseButton(let button):
+            return "Mouse \(button + 1)"
         }
     }
 
@@ -121,6 +140,7 @@ enum Shortcut: Equatable {
         case .combo(let keyCode, _): return keyCodeToString(keyCode)?.lowercased() ?? ""
         case .doubleTap:             return ""
         case .modifier:              return ""
+        case .mouseButton:           return ""
         }
     }
 
@@ -138,6 +158,8 @@ enum Shortcut: Equatable {
             return []
         case .modifier:
             return []
+        case .mouseButton:
+            return []
         }
     }
 
@@ -149,6 +171,8 @@ enum Shortcut: Equatable {
             return "doubletap:\(modifier.rawValue)"
         case .modifier(let modifier):
             return "mod:\(modifier.rawValue)"
+        case .mouseButton(let button):
+            return "mouse:\(button)"
         }
     }
 
@@ -156,6 +180,13 @@ enum Shortcut: Equatable {
         if value.hasPrefix("doubletap:") {
             let raw = String(value.dropFirst("doubletap:".count))
             return ModifierKey(rawValue: raw).map { .doubleTap($0) }
+        }
+        if value.hasPrefix("mouse:"), let button = Int(value.dropFirst("mouse:".count)) {
+            // A stored value below the floor is rejected rather than honoured: a
+            // binding on left-click would make the app unrecoverable through its
+            // own UI. Returning nil lets the caller fall back to the default.
+            guard button >= minimumBindableMouseButton else { return nil }
+            return .mouseButton(button)
         }
         // "mod:" is the current single-modifier prefix; "hold:" is the earlier name.
         for prefix in ["mod:", "hold:"] where value.hasPrefix(prefix) {
@@ -188,7 +219,7 @@ enum Shortcut: Equatable {
         case kVK_Delete:   return "Delete"
         case kVK_Function: return ""
         default:
-            if let string = keyCodeToString(keyCode) { return string.uppercased() }
+            if let string = keyCodeToString(keyCode), !string.isEmpty { return string.uppercased() }
             return "#\(keyCode)"
         }
     }
@@ -304,8 +335,29 @@ final class GlobalShortcutMonitor {
         let flags = event.flags.intersection(relevantFlags)
         let eventKeyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
 
-        if eventKeyCode == CGKeyCode(kVK_Function) {
-            return true
+        if Shortcut.isFnKey(eventKeyCode) {
+            // Bindings store the canonical kVK_Function, but keyboards that emit
+            // the Globe key as a key rather than a modifier deliver one of the
+            // other fn keycodes here. Match those against an fn binding; a real
+            // kVK_Function press belongs to the flagsChanged path below.
+            guard keyCode == CGKeyCode(kVK_Function),
+                  eventKeyCode != CGKeyCode(kVK_Function) else { return true }
+
+            switch type {
+            case .keyDown:
+                if !isPressed {
+                    isPressed = true
+                    handler(.keyDown)
+                }
+            case .keyUp:
+                if isPressed {
+                    isPressed = false
+                    handler(.keyUp)
+                }
+            default:
+                break
+            }
+            return false
         }
 
         guard eventKeyCode == keyCode, flags == modifiers else {
@@ -568,6 +620,123 @@ final class ModifierKeyMonitor {
             isDown = false
             handler(.keyUp)
         }
+    }
+}
+
+// MARK: - MouseButtonMonitor
+
+/// Fires keyDown and keyUp for one extra mouse button. Matching events are
+/// swallowed because these buttons commonly navigate browser and Finder history.
+final class MouseButtonMonitor {
+    enum Event { case keyDown, keyUp }
+
+    private let button: Int
+    private let handler: (Event) -> Void
+
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var monitorQueue: DispatchQueue?
+    /// The run loop the source was added to. `stop()` runs on the caller's
+    /// thread, so it needs a handle on the worker's loop to tear it down;
+    /// removing the source from whatever loop happens to be current instead
+    /// would leave the worker parked in `CFRunLoopRun()` forever.
+    private var monitorRunLoop: CFRunLoop?
+    private var isDown = false
+
+    init(button: Int, handler: @escaping (Event) -> Void) {
+        self.button = button
+        self.handler = handler
+    }
+
+    func start() {
+        guard eventTap == nil else { return }
+
+        let mask = (1 << CGEventType.otherMouseDown.rawValue)
+            | (1 << CGEventType.otherMouseUp.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            guard let userInfo else { return Unmanaged.passUnretained(event) }
+            let monitor = Unmanaged<MouseButtonMonitor>.fromOpaque(userInfo).takeUnretainedValue()
+            return monitor.handle(event: event, type: type)
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask),
+            callback: callback,
+            userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        ) else {
+            vxLog("[mousebutton/start] Failed to create CGEventTap")
+            return
+        }
+
+        eventTap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+
+        monitorQueue = DispatchQueue(label: "voice.vx.mousebutton", qos: .userInteractive)
+        monitorQueue?.async { [weak self] in
+            guard let self, let source = self.runLoopSource else { return }
+            let runLoop = CFRunLoopGetCurrent()
+            self.monitorRunLoop = runLoop
+            CFRunLoopAddSource(runLoop, source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            CFRunLoopRun()
+        }
+    }
+
+    func stop() {
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        // A monitor can be torn down while the button is still physically held —
+        // swapping the binding, or pausing shortcuts to record a new one. Report
+        // the release so whatever the press started is not left running; the
+        // replacement monitor starts from a clean slate and never sees this up.
+        if isDown {
+            isDown = false
+            handler(.keyUp)
+        }
+        if let source = runLoopSource, let runLoop = monitorRunLoop {
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFRunLoopStop(runLoop)
+        }
+        monitorRunLoop = nil
+        runLoopSource = nil
+        eventTap = nil
+        monitorQueue = nil
+    }
+
+    private func handle(event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let eventTap {
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+            }
+            return nil
+        }
+
+        guard type == .otherMouseDown || type == .otherMouseUp,
+              event.getIntegerValueField(.mouseEventButtonNumber) == Int64(button) else {
+            return Unmanaged.passUnretained(event)
+        }
+
+        if type == .otherMouseDown, !isDown {
+            isDown = true
+            handler(.keyDown)
+            return nil
+        }
+
+        if type == .otherMouseUp {
+            guard isDown else {
+                // A release with no press of ours behind it — the monitor started
+                // while the button was already held. Swallowing it would strand the
+                // button down in whatever app is focused, so let it through.
+                return Unmanaged.passUnretained(event)
+            }
+            isDown = false
+            handler(.keyUp)
+        }
+        return nil
     }
 }
 

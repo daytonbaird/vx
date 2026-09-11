@@ -48,10 +48,13 @@ public final class AppCoordinator: NSObject {
     private var shortcutMonitor: GlobalShortcutMonitor?
     private var doubleTapMonitor: DoubleTapMonitor?
     private var modifierMonitor: ModifierKeyMonitor?
+    private var mouseButtonMonitor: MouseButtonMonitor?
     private var copyLastMonitor: GlobalShortcutMonitor?
+    private var copyLastMouseButtonMonitor: MouseButtonMonitor?
     private var goModeShortcutMonitor: GlobalShortcutMonitor?
     private var goModeDoubleTapMonitor: DoubleTapMonitor?
     private var goModeModifierMonitor: ModifierKeyMonitor?
+    private var goModeMouseButtonMonitor: MouseButtonMonitor?
     /// Output was Bluetooth when the current capture began, so the duck is deferred until
     /// `.recordingStarted` (see the ordering note in `flow(_:didEmit:)`).
     private var deferredBluetoothDuck = false
@@ -217,10 +220,13 @@ public final class AppCoordinator: NSObject {
         shortcutMonitor?.stop()
         doubleTapMonitor?.stop()
         modifierMonitor?.stop()
+        mouseButtonMonitor?.stop()
         copyLastMonitor?.stop()
+        copyLastMouseButtonMonitor?.stop()
         goModeShortcutMonitor?.stop()
         goModeDoubleTapMonitor?.stop()
         goModeModifierMonitor?.stop()
+        goModeMouseButtonMonitor?.stop()
         flow.invalidate()
         FnKeyTap.shared.deactivate()
     }
@@ -248,14 +254,20 @@ public final class AppCoordinator: NSObject {
                 self?.doubleTapMonitor = nil
                 self?.modifierMonitor?.stop()
                 self?.modifierMonitor = nil
+                self?.mouseButtonMonitor?.stop()
+                self?.mouseButtonMonitor = nil
                 self?.copyLastMonitor?.stop()
                 self?.copyLastMonitor = nil
+                self?.copyLastMouseButtonMonitor?.stop()
+                self?.copyLastMouseButtonMonitor = nil
                 self?.goModeShortcutMonitor?.stop()
                 self?.goModeShortcutMonitor = nil
                 self?.goModeDoubleTapMonitor?.stop()
                 self?.goModeDoubleTapMonitor = nil
                 self?.goModeModifierMonitor?.stop()
                 self?.goModeModifierMonitor = nil
+                self?.goModeMouseButtonMonitor?.stop()
+                self?.goModeMouseButtonMonitor = nil
             }
             .store(in: &cancellables)
 
@@ -266,6 +278,8 @@ public final class AppCoordinator: NSObject {
                 // shortcut change that occurred while shortcuts were paused.
                 self?.copyLastMonitor?.stop()
                 self?.copyLastMonitor = nil
+                self?.copyLastMouseButtonMonitor?.stop()
+                self?.copyLastMouseButtonMonitor = nil
                 self?.setupCopyLastShortcut()
                 self?.restartGoModeShortcutMonitor()
             }
@@ -280,13 +294,9 @@ public final class AppCoordinator: NSObject {
                 guard let self else { return }
                 self.copyLastMonitor?.stop()
                 self.copyLastMonitor = nil
-                guard case .combo(let keyCode, let modifiers) = newShortcut else { return }
-                let monitor = GlobalShortcutMonitor(keyCode: keyCode, modifiers: modifiers) { [weak self] event in
-                    guard event == .keyDown else { return }
-                    DispatchQueue.main.async { self?.copyLastTranscription() }
-                }
-                monitor.start()
-                self.copyLastMonitor = monitor
+                self.copyLastMouseButtonMonitor?.stop()
+                self.copyLastMouseButtonMonitor = nil
+                self.setupCopyLastShortcut(newShortcut)
             }
             .store(in: &cancellables)
 
@@ -384,19 +394,35 @@ public final class AppCoordinator: NSObject {
         doubleTapMonitor = nil
         modifierMonitor?.stop()
         modifierMonitor = nil
+        mouseButtonMonitor?.stop()
+        mouseButtonMonitor = nil
         FnKeyTap.shared.deactivate()
         setupShortcut()
     }
 
-    private func setupCopyLastShortcut() {
-        guard copyLastMonitor == nil else { return }
-        guard case .combo(let keyCode, let modifiers) = appState.copyLastShortcut else { return }
-        let monitor = GlobalShortcutMonitor(keyCode: keyCode, modifiers: modifiers) { [weak self] event in
-            guard event == .keyDown else { return }
-            DispatchQueue.main.async { self?.copyLastTranscription() }
+    private func setupCopyLastShortcut(_ shortcut: Shortcut? = nil) {
+        guard copyLastMonitor == nil, copyLastMouseButtonMonitor == nil else { return }
+
+        switch shortcut ?? appState.copyLastShortcut {
+        case .combo(let keyCode, let modifiers):
+            let monitor = GlobalShortcutMonitor(keyCode: keyCode, modifiers: modifiers) { [weak self] event in
+                guard event == .keyDown else { return }
+                DispatchQueue.main.async { self?.copyLastTranscription() }
+            }
+            monitor.start()
+            copyLastMonitor = monitor
+
+        case .mouseButton(let button):
+            let monitor = MouseButtonMonitor(button: button) { [weak self] event in
+                guard event == .keyDown else { return }
+                DispatchQueue.main.async { self?.copyLastTranscription() }
+            }
+            monitor.start()
+            copyLastMouseButtonMonitor = monitor
+
+        case .doubleTap, .modifier:
+            break
         }
-        monitor.start()
-        copyLastMonitor = monitor
     }
 
     private func restartGoModeShortcutMonitor() {
@@ -406,13 +432,16 @@ public final class AppCoordinator: NSObject {
         goModeDoubleTapMonitor = nil
         goModeModifierMonitor?.stop()
         goModeModifierMonitor = nil
+        goModeMouseButtonMonitor?.stop()
+        goModeMouseButtonMonitor = nil
         setupGoModeShortcut()
     }
 
     private func setupGoModeShortcut() {
         guard goModeShortcutMonitor == nil,
               goModeDoubleTapMonitor == nil,
-              goModeModifierMonitor == nil else { return }
+              goModeModifierMonitor == nil,
+              goModeMouseButtonMonitor == nil else { return }
 
         switch appState.goModeShortcut {
         case .combo(let keyCode, let modifiers):
@@ -438,6 +467,14 @@ public final class AppCoordinator: NSObject {
             }
             monitor.start()
             goModeModifierMonitor = monitor
+
+        case .mouseButton(let button):
+            let monitor = MouseButtonMonitor(button: button) { [weak self] event in
+                guard event == .keyDown else { return }
+                DispatchQueue.main.async { self?.flow.toggleGoMode() }
+            }
+            monitor.start()
+            goModeMouseButtonMonitor = monitor
         }
     }
 
@@ -589,6 +626,19 @@ public final class AppCoordinator: NSObject {
             }
             monitor.start()
             modifierMonitor = monitor
+
+        case .mouseButton(let button):
+            let monitor = MouseButtonMonitor(button: button) { [weak self] event in
+                guard let self else { return }
+                switch (self.appState.activationMode, event) {
+                case (.holdToTalk, .keyDown): DispatchQueue.main.async { self.flow.beginRecording() }
+                case (.holdToTalk, .keyUp):   DispatchQueue.main.async { self.flow.finishRecording() }
+                case (.toggle,     .keyDown): DispatchQueue.main.async { self.flow.toggleRecording() }
+                case (.toggle,     .keyUp):   break
+                }
+            }
+            monitor.start()
+            mouseButtonMonitor = monitor
         }
     }
 

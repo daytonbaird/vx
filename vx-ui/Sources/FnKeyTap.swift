@@ -91,14 +91,11 @@ final class FnKeyTap {
             return Unmanaged.passUnretained(event)
         }
 
-        // Handle Globe key (keyDown/keyUp) - common keycodes: 179, 193, 103
+        // Handle Globe key keyDown/keyUp events when it is not delivered as fn flagsChanged.
         if type == .keyDown || type == .keyUp {
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            
-            // Common Globe key keycodes (some keyboards use different values)
-            let globeKeycodes: [Int64] = [179, 193, 103]
-            
-            if globeKeycodes.contains(keyCode) {
+
+            if keyCode != Int64(kVK_Function), Shortcut.fnKeycodes.contains(Int(keyCode)) {
                 if type == .keyDown {
                     pendingModifierRelease?.cancel()
                     pendingModifierRelease = nil
@@ -123,7 +120,6 @@ final class FnKeyTap {
                     return nil
                 }
             }
-            
             // If it's not a Globe key, pass it through
             return Unmanaged.passUnretained(event)
         }

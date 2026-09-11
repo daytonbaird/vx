@@ -241,8 +241,8 @@ struct PreferencesView: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(appState.activationMode == .holdToTalk
-                         ? "Use a single modifier or a key combo (e.g. ⌘Z). Right Option stays out of the way of typing."
-                         : "Use a single modifier, a double-tap of one, or a key combo. Right Option stays out of the way of typing.")
+                         ? "Use a single modifier or a key combo (e.g. ⌘Z). Right Option stays out of the way of typing. Extra mouse buttons (Mouse 4/5) work too."
+                         : "Use a single modifier, a double-tap of one, or a key combo. Right Option stays out of the way of typing. Extra mouse buttons (Mouse 4/5) work too.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1885,6 +1885,8 @@ private final class ShortcutCaptureMonitor {
         let mask = (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.flagsChanged.rawValue)
+            | (1 << CGEventType.otherMouseDown.rawValue)
+            | (1 << CGEventType.otherMouseUp.rawValue)
 
         let callback: CGEventTapCallBack = { _, type, event, userInfo in
             guard let userInfo else { return Unmanaged.passUnretained(event) }
@@ -1932,6 +1934,11 @@ private final class ShortcutCaptureMonitor {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
 
         switch type {
+        case .otherMouseDown:
+            let button = Int(event.getIntegerValueField(.mouseEventButtonNumber))
+            guard button >= Shortcut.minimumBindableMouseButton else { return }
+            cancelDoubleTapTracking()
+            emit(.mouseButton(button))
         case .keyDown:
             // Any regular key press cancels double-tap tracking
             cancelDoubleTapTracking()

@@ -31,6 +31,22 @@ cd ../vx-ui && swift run vx-ui
 `ResourceLocator` resolves the backend from the sibling `vx-rs` build when
 running from source, so no packaging step is needed for development.
 
+## Shortcuts
+
+Set the dictation shortcut in **Preferences → Configuration → Shortcut**. You can bind:
+
+- a key combo (`⌘Z`)
+- a single modifier, held or double-tapped (Right Option stays clear of typing)
+- the `fn` / 🌐 key
+- an extra mouse button — Mouse 4, Mouse 5, or any higher side button
+
+Mouse 4 and 5 are usually the thumb buttons that act as Back and Forward. vx
+swallows the button it is bound to, so it stops navigating history while it is
+your dictation key. Left, right and middle click cannot be bound. If pressing a
+side button does nothing while recording a shortcut, your mouse software
+(Logitech Options+, Razer Synapse, SteelSeries GG) is likely remapping it before
+macOS sees it — set that button back to its default there.
+
 ## Whisper models
 
 vx uses GGML-format Whisper models (`.bin`). **Models are not checked into the
