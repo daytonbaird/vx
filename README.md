@@ -31,6 +31,31 @@ cd ../vx-ui && swift run vx-ui
 `ResourceLocator` resolves the backend from the sibling `vx-rs` build when
 running from source, so no packaging step is needed for development.
 
+Without full Xcode installed, use `swift build -c release` / `swift run -c release vx-ui`
+instead. A debug build expands the `#Preview` macros, whose plugin ships with
+Xcode rather than the Command Line Tools; the previews sit behind `#if DEBUG`,
+so a release build skips them.
+
+### Build a standalone app
+
+```bash
+Scripts/package-app.sh
+```
+
+This creates `vx-ui/build/vx.app`, ready to open in place or copy into
+`/Applications`. The bundle is ad-hoc signed so macOS keeps its Accessibility
+and Microphone grants across rebuilds; the first launch still has to be granted
+Accessibility, and vx needs relaunching once that is done.
+
+Set `VX_VERSION` to stamp the bundle's version. A locally built app reports the
+version in `Info.plist`, so leaving it at the default makes the updater offer
+the latest public release — installing that would replace your build.
+
+```bash
+VX_VERSION=99.0.0 Scripts/package-app.sh   # keeps the updater quiet
+VX_SKIP_MODEL=1 Scripts/package-app.sh     # skip the ~78 MB model copy
+```
+
 ## Shortcuts
 
 Set the dictation shortcut in **Preferences → Configuration → Shortcut**. You can bind:
