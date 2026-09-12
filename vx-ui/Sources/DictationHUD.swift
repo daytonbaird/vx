@@ -882,12 +882,46 @@ final class DictationHUDController {
         }
     }
 
+    /// Returns the display containing the pointer. `NSScreen.main` follows the key window,
+    /// which is not necessarily on the pointer's display for a non-activating panel.
+    private static func screenUnderCursor() -> NSScreen? {
+        let location = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(location, $0.frame, false) }
+            ?? NSScreen.main
+    }
+
     private func positionWindow() {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = Self.screenUnderCursor() else { return }
         let width: CGFloat = 330
-        let x = screen.visibleFrame.midX - width / 2
-        let y = screen.visibleFrame.minY + 40
-        window.setFrame(NSRect(x: x, y: y, width: width, height: 115), display: false)
+        let height: CGFloat = 115
+
+        // This runs while the panel is still ordered out, and `window.screen` is nil for an
+        // offscreen window, so the display it currently sits on has to come from its frame.
+        let currentScreen = NSScreen.screens.first { $0.frame.intersects(window.frame) }
+
+        guard let currentScreen else {
+            let x = screen.visibleFrame.midX - width / 2
+            let y = screen.visibleFrame.minY + 40
+            window.setFrame(NSRect(x: x, y: y, width: width, height: height), display: false)
+            return
+        }
+
+        // Already where the pointer is: leave the frame alone so a position the user
+        // dragged the HUD to survives.
+        guard currentScreen != screen else { return }
+
+        // Carry the user's placement across by reusing the same offset inside the new
+        // display's visible area. Displays differ in size, so an offset from a wide one can
+        // overshoot a narrow one; clamp here rather than leaving it to the panel's own
+        // clamping, which resolves the display from whatever the frame overlaps and would
+        // pull an overshooting HUD back onto the display it came from.
+        let visible = screen.visibleFrame
+        let offsetX = window.frame.minX - currentScreen.visibleFrame.minX
+        let offsetY = window.frame.minY - currentScreen.visibleFrame.minY
+        let margin: CGFloat = 12
+        let x = min(max(visible.minX + margin, visible.minX + offsetX), visible.maxX - width - margin)
+        let y = min(max(visible.minY + margin, visible.minY + offsetY), visible.maxY - height - margin)
+        window.setFrame(NSRect(x: x, y: y, width: width, height: height), display: false)
     }
 
     private func updateWindow(for state: DictationHUDModel.State) {
@@ -896,9 +930,11 @@ final class DictationHUDController {
         case .hidden:
             hideWindow()
         case .hint:
+            positionWindow()
             window.orderFrontRegardless()
             window.setContentSize(NSSize(width: 330, height: 115))
         case .listening:
+            positionWindow()
             window.orderFrontRegardless()
             let height = 115 + HUDConfig.glowRadius
             window.setContentSize(NSSize(width: 330, height: height))
