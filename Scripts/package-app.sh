@@ -40,6 +40,11 @@ cp "$ROOT/vx-rs/target/release/vx-rs" "$RESOURCES/Backend/vx-rs"
 chmod +x "$RESOURCES/Backend/vx-rs"
 printf 'APPL????' > "$CONTENTS/PkgInfo"
 
+# CFBundleExecutable is what ties a running process back to the bundle. Without it
+# macOS still launches the app by falling back to CFBundleName, but TCC cannot
+# match the process to the app the user authorised, so Accessibility and
+# Microphone grants silently never apply.
+/usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string vx' "$CONTENTS/Info.plist"
 /usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string vx' "$CONTENTS/Info.plist"
 if [[ -n "${VX_VERSION:-}" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VX_VERSION" "$CONTENTS/Info.plist"
