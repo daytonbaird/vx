@@ -788,12 +788,14 @@ public final class AppCoordinator: NSObject {
     private func installEscapeMonitorIfNeeded() {
         guard escapeGlobalMonitor == nil, escapeLocalMonitor == nil else { return }
 
+        // Local monitors run on the main thread, so the recording state can be read here
+        // rather than hopped to. That matters: the event may only be swallowed when it
+        // actually cancels a recording, otherwise Escape stops reaching the app's own
+        // sheets and menus for as long as dictation is running.
         let handler: (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == CGKeyCode(kVK_Escape) else { return event }
-            DispatchQueue.main.async {
-                guard let self, self.flow.isRecording else { return }
-                self.flow.cancelRecording()
-            }
+            guard let self, self.flow.isRecording else { return event }
+            self.flow.cancelRecording()
             return nil
         }
 
@@ -921,6 +923,7 @@ extension AppCoordinator: DictationFlowDelegate {
             )
 
         case .recordingWillStop:
+            trigger.clearLatch()
             // Play before the source stops — on Bluetooth devices (AirPods) the device
             // transitions from SCO/HFP back to A2DP after teardown, and during that
             // handoff the device reports as muted, silencing any sound played after stop.
@@ -972,6 +975,7 @@ extension AppCoordinator: DictationFlowDelegate {
             logFailure(message, dismissAfter: flow.lastFailureDismissAfter)
 
         case .cancelled:
+            trigger.clearLatch()
             deferredBluetoothDuck = false
             removeEscapeMonitor()
             updateStatusItemAppearance(isActive: false)
